@@ -194,11 +194,9 @@ backend/                 Python backend (FastAPI + LangGraph), uv-managed
     language/                   Phase 8: language ID + translation, wraps agent.py
   config/models.yaml       *the* file that decides which model does what
   data/sop_docs/            sample documents the Knowledge Base searches
-  data/deliverables/         finished .docx files land here
-  data/models/                downloaded local models that aren't Ollama/HF-cached (lid.176.bin)
+  data/deliverables/         finished .docx/.xlsx/.pptx files land here
   eval/                      recall/precision test suite for the search pipeline
   scripts/ingest_knowledge.py    (re)index the documents into Qdrant
-  scripts/download_lid_model.py   one-time fetch of the language-ID model
 
 frontend/                Vue 3 + Tailwind + Vite single-page app
   src/views/               one file per sidebar page
@@ -263,12 +261,6 @@ uv sync                                  # installs everything, no system Python
 # index the sample documents into Qdrant, so the Knowledge Base has something
 # to search (re-run this any time you add/change documents in data/sop_docs/)
 uv run python -m scripts.ingest_knowledge
-
-# one-time download of the language-ID model (~131MB, public, no auth) —
-# needed for the Hindi/Tamil/Telugu/Kannada/Malayalam layer to detect a
-# non-English prompt at all. Skip this and everything else still works,
-# every prompt is just treated as English.
-uv run python -m scripts.download_lid_model
 
 # start the API server
 uv run uvicorn app.main:app --reload --port 8000
@@ -475,10 +467,6 @@ inspection-report example above, applied to a drawing instead of text.
   model's own custom attention code on a KV-cache shape mismatch that
   hasn't been resolved yet. Everything else in this app is unaffected —
   this is isolated to IndicTrans2 translation specifically.
-- **Language detection says everything is English** — you skipped the
-  `scripts.download_lid_model` step in step 3; without that model, every
-  prompt is treated as English by design (a missing model degrades to "assume
-  English" rather than failing the whole request).
 - **A complex, multi-part request sits on "Thinking…" for a while before
   anything else shows up** — that's expected, not a hang: reasoning models
   stream their thinking separately from their answer, and the Console now

@@ -5,9 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "fast-langdetect>=1.0.1",
     "fastapi>=0.141.1",
     "faster-whisper>=1.2.1",
-    "fasttext-wheel>=0.9.2",
     "indictranstoolkit>=1.1.1",
     "langchain-ollama>=1.1.0",
     "langchain-text-splitters>=1.1.2",
