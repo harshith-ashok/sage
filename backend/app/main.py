@@ -5,8 +5,10 @@ insurance_claim_agent/api/main.py's pattern.
 """
 
 import base64
+import io
 import os
 import tempfile
+import zipfile
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,9 +17,12 @@ from pydantic import BaseModel
 
 from app import config as model_config
 from app.documents.extract import UnsupportedDocumentType, extract_text
+from app.knowledge.graph import build_corpus_graph
 from app.knowledge.query import run_query
 from app.language.pipeline import run_agent_multilingual
 from app.language.translate import SUPPORTED_LANGUAGES, translate_from_english
+from app.load_monitor import get_fallback_log, get_system_load
+from app.network_monitor import snapshot as network_snapshot
 from app.ollama_client import list_local_models
 from app.speech.stt import transcribe as transcribe_audio
 from app.task_stream import start_task, stream_task
@@ -40,6 +45,10 @@ class SetActiveModelRequest(BaseModel):
 class TranslateRequest(BaseModel):
     text: str
     target_language: str
+
+
+class DeliverableFilenamesRequest(BaseModel):
+    filenames: list[str]
 
 
 @app.get("/models")
@@ -74,6 +83,56 @@ def set_active_model(task_type: str, body: SetActiveModelRequest):
     return {"task_type": task_type, "active": body.candidate_key, "candidate": candidate.model_dump()}
 
 
+@app.get("/system/load")
+def get_system_load_endpoint():
+    """Phase 11: the live signal app/router.py's load-aware routing acts on
+    (see app/load_monitor.py for what "load" means on this hardware and
+    why), plus a recent log of any fallbacks it's actually taken — the
+    Model Registry view polls this to show current pressure and whether
+    routing has quietly degraded anything."""
+    load = get_system_load()
+    return {
+        "level": load.level,
+        "available_percent": load.available_percent,
+        "loaded_models": [
+            {"model_id": m.model_id, "size_bytes": m.size_bytes, "size_vram_bytes": m.size_vram_bytes}
+            for m in load.loaded_models
+        ],
+        "fallback_log": [
+            {
+                "task_type": e.task_type,
+                "from_model_id": e.from_model_id,
+                "to_model_id": e.to_model_id,
+                "reason": e.reason,
+                "timestamp": e.timestamp,
+            }
+            for e in reversed(get_fallback_log())
+        ],
+    }
+
+
+@app.get("/system/network")
+def get_system_network_endpoint():
+    """Phase 12: zero-egress proof — see app/network_monitor.py for what
+    "external" means and which processes are actually watched. The Network
+    Monitor view polls this to render the live "N external calls"
+    indicator plus a running log of anything ever caught."""
+    snap = network_snapshot()
+    return {
+        "external_count": snap.external_count,
+        "external_connections": [
+            {"pid": c.pid, "process": c.process, "remote": c.remote, "timestamp": c.timestamp}
+            for c in snap.external_connections
+        ],
+        "local_connection_count": snap.local_connection_count,
+        "watched_processes": snap.watched_processes,
+        "external_log": [
+            {"pid": c.pid, "process": c.process, "remote": c.remote, "timestamp": c.timestamp}
+            for c in reversed(snap.external_log)
+        ],
+    }
+
+
 @app.post("/agent/chat")
 async def create_agent_chat(
     prompt: str = Form(...),
@@ -82,6 +141,7 @@ async def create_agent_chat(
     document: UploadFile | None = File(None),
     conversation_id: str | None = Form(None),
     output_language: str | None = Form(None),
+    use_knowledge_base: bool = Form(True),
 ):
     """The Console's single entry point: one free-form prompt, one optional
     attached image, audio clip, and/or text document, no task-type picker.
@@ -103,7 +163,13 @@ async def create_agent_chat(
     what language the prompt itself was written in — omitted, the answer
     mirrors the input language exactly as before this existed (English in,
     English out; a supported non-English language in, the same language
-    back)."""
+    back).
+
+    `use_knowledge_base` (default True): the acceptance checklist's
+    "Knowledge base grounding: turn it off, confirm the answer changes" —
+    False removes the knowledge-base tools from the model entirely for
+    this turn, so an answer that would otherwise cite the SOP corpus comes
+    from the model's own general knowledge instead."""
     image_b64 = None
     if file is not None:
         image_bytes = await file.read()
@@ -130,7 +196,7 @@ async def create_agent_chat(
 
     def work(emit):
         try:
-            run_agent_multilingual(prompt, image_b64, emit, audio_path, document_text, conversation_id, output_language)
+            run_agent_multilingual(prompt, image_b64, emit, audio_path, document_text, conversation_id, output_language, use_knowledge_base)
         finally:
             if audio_path:
                 os.remove(audio_path)
@@ -193,6 +259,15 @@ def knowledge_search(
     generate -> verify citations -> flag confidence) against the ingested
     SOP corpus (scripts/ingest_knowledge.py)."""
     return run_query(query, target_section=target_section, target_source=target_source, top_k=top_k)
+
+
+@app.get("/knowledge/graph")
+def knowledge_graph():
+    """The actual ingested corpus structure — documents, their sections,
+    chunk counts — for the Knowledge Base view's graph panel. Not a search
+    result: this is what's *in* the knowledge base, rendered once and
+    highlighted against afterward as searches come in."""
+    return build_corpus_graph()
 
 
 @app.post("/tasks/document")
@@ -263,3 +338,48 @@ def download_deliverable(filename: str):
     ext = os.path.splitext(filename)[1].lower()
     media_type = _DELIVERABLE_MEDIA_TYPES.get(ext, "application/octet-stream")
     return FileResponse(path, media_type=media_type, filename=filename)
+
+
+def _safe_deliverable_path(filename: str) -> str:
+    """Rejects any filename that isn't a plain name inside DELIVERABLES_DIR
+    — same guard as download_deliverable's `"/" in filename` check, shared
+    here since the batch endpoints below (Phase 13) touch multiple
+    filenames from one request body instead of a single URL path segment."""
+    path = os.path.join(DELIVERABLES_DIR, filename)
+    if "/" in filename or ".." in filename or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail=f"No such deliverable: {filename}")
+    return path
+
+
+@app.post("/deliverables/export")
+def export_deliverables(body: DeliverableFilenamesRequest):
+    """Phase 13: bulk export — zips the selected deliverables in-memory
+    (these are individual small office documents, not large media, so
+    holding the zip in memory rather than streaming to a temp file is a
+    reasonable trade for simplicity) and returns it as one download."""
+    if not body.filenames:
+        raise HTTPException(status_code=400, detail="No filenames given")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename in body.filenames:
+            path = _safe_deliverable_path(filename)
+            zf.write(path, arcname=filename)
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=deliverables.zip"},
+    )
+
+
+@app.post("/deliverables/delete")
+def delete_deliverables(body: DeliverableFilenamesRequest):
+    """Phase 13: bulk delete — validates every filename before deleting any
+    of them, so a single bad name in the batch fails the whole request
+    instead of silently deleting some and skipping others."""
+    if not body.filenames:
+        raise HTTPException(status_code=400, detail="No filenames given")
+    paths = [_safe_deliverable_path(filename) for filename in body.filenames]
+    for path in paths:
+        os.remove(path)
+    return {"deleted": len(paths)}

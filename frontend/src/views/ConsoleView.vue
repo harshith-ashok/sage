@@ -3,6 +3,7 @@ import { nextTick, onMounted, onUnmounted, ref } from "vue";
 import Button from "../components/base/Button.vue";
 import CodeModal from "../components/base/CodeModal.vue";
 import Markdown from "../components/base/Markdown.vue";
+import NetworkStatusBadge from "../components/base/NetworkStatusBadge.vue";
 import { API_BASE, apiPost, apiPostForm, streamSSE } from "../lib/api";
 
 type Segment =
@@ -10,11 +11,13 @@ type Segment =
   | { kind: "text"; id: string; content: string; streaming: boolean; originalEnglish?: string; showOriginal?: boolean }
   | { kind: "tool_call"; tool: string; args: any }
   | { kind: "tool_result"; tool: string; content: string }
+  | { kind: "tier_selected"; taskType: string; tier: string; modelId?: string }
   | { kind: "language_detected"; language: string; confidence?: number; probability?: number }
   | { kind: "segment_timing"; start: number; end: number; text: string }
   | { kind: "translated_prompt"; english: string }
   | { kind: "translating" }
-  | { kind: "language_warning"; warning: string };
+  | { kind: "language_warning"; warning: string }
+  | { kind: "scope_blocked" };
 
 interface Turn {
   prompt: string;
@@ -32,6 +35,7 @@ interface Turn {
 
 const TOOL_LABELS: Record<string, string> = {
   search_knowledge_base: "Searching the knowledge base",
+  check_cross_document_contradictions: "Checking for conflicts against records",
   read_uploaded_image: "Reading the attached image",
   read_pid_drawing: "Reading the P&ID drawing",
   run_sandboxed_code: "Running code in the sandbox",
@@ -297,8 +301,16 @@ async function toggleRecording() {
 }
 
 function deliverableLink(content: string): { filename: string } | null {
-  const match = /Saved as ([\w.-]+\.docx)/.exec(content);
+  const match = /Saved as ([\w.-]+\.(?:docx|xlsx|pptx))/.exec(content);
   return match ? { filename: match[1] } : null;
+}
+
+// check_cross_document_contradictions (app/agent.py) instructs the model to
+// mark a real conflict with this exact literal string — a plain substring
+// check here is enough to surface it as a distinct, hard-to-miss banner
+// instead of it just being one more paragraph in the answer.
+function hasContradictionFlag(content: string): boolean {
+  return content.includes("⚠️ CONFLICT:") || content.includes("⚠️ CONFLICT :");
 }
 
 function onViewCode(code: string, language: string) {
@@ -423,6 +435,10 @@ async function submit() {
           turn.segments.push({ kind: "tool_result", tool: d.tool, content: d.content });
           scrollToBottom();
         },
+        tier_selected: (d) => {
+          turn.segments.push({ kind: "tier_selected", taskType: d.task_type, tier: d.tier, modelId: d.model_id });
+          scrollToBottom();
+        },
         language_detected: (d) => {
           turn.segments.push({ kind: "language_detected", ...d });
           scrollToBottom();
@@ -454,6 +470,13 @@ async function submit() {
         },
         language_warning: (d) => {
           turn.segments.push({ kind: "language_warning", warning: d.warning });
+        },
+        scope_blocked: () => {
+          // The topic guardrail (app/scope_guard.py) refused this turn before
+          // the agent ever ran — no tool_call/tier_selected trace exists for
+          // it, so this is the only signal marking it as a refusal rather
+          // than a normal short answer.
+          turn.segments.push({ kind: "scope_blocked" });
         },
         done: (d) => {
           // Any segment still marked "streaming" (no matching `message` arrived,
@@ -524,7 +547,8 @@ onUnmounted(() => {
           decides what to do.
         </p>
       </div>
-      <div class="flex shrink-0 flex-col items-end gap-1">
+      <div class="flex shrink-0 flex-col items-end gap-1.5">
+        <NetworkStatusBadge />
         <div class="flex items-center gap-2">
           <span class="text-[11px] text-dim" title="Every answer already on screen re-translates the instant you click one">Answer in</span>
           <div class="flex overflow-hidden rounded-md border border-border">
@@ -535,7 +559,7 @@ onUnmounted(() => {
               :disabled="retranslating"
               class="px-2 py-1 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
               :class="[
-                outputLanguage === opt.value ? 'bg-accent text-bg' : 'bg-panel-2 text-dim hover:text-text',
+                outputLanguage === opt.value ? 'bg-accent text-accent-ink' : 'bg-panel-2 text-dim hover:text-text',
                 i > 0 ? 'border-l border-border' : '',
               ]"
               @click="onLanguageToggle(opt.value)"
@@ -582,6 +606,16 @@ onUnmounted(() => {
                 </div>
               </details>
 
+              <div v-else-if="seg.kind === 'tier_selected'" class="flex items-center gap-2 text-[11px] text-dim-2">
+                <span
+                  class="rounded-full border px-1.5 py-0.5 font-mono text-[9.5px] uppercase tracking-wide"
+                  :class="seg.tier === 'strong' ? 'border-accent/30 text-accent' : 'border-border-soft text-dim-2'"
+                >
+                  {{ seg.tier }}
+                </span>
+                <span>{{ seg.taskType }}{{ seg.modelId ? ` · ${seg.modelId}` : "" }}</span>
+              </div>
+
               <div v-else-if="seg.kind === 'tool_call'" class="flex items-center gap-2 text-[12px] text-dim">
                 <span class="h-1.5 w-1.5 rounded-full bg-accent" :class="{ 'animate-pulse': turn.status === 'running' }" />
                 <span>{{ TOOL_LABELS[seg.tool] ?? seg.tool }}…</span>
@@ -612,6 +646,13 @@ onUnmounted(() => {
               </div>
 
               <div v-else-if="seg.kind === 'text' && seg.content" class="text-[13px] leading-relaxed text-text">
+                <div
+                  v-if="!seg.streaming && hasContradictionFlag(seg.content)"
+                  class="mb-2 flex items-center gap-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] font-medium text-danger"
+                >
+                  <span class="h-1.5 w-1.5 shrink-0 rounded-full bg-danger" />
+                  Contradiction flagged against site records — see below
+                </div>
                 <Markdown v-if="!seg.streaming" :content="seg.content" @view-code="onViewCode" />
                 <p v-else class="whitespace-pre-wrap">{{ seg.content }}<span class="sage-caret text-accent">▍</span></p>
                 <button
@@ -643,6 +684,10 @@ onUnmounted(() => {
               <p v-else-if="seg.kind === 'language_warning'" class="rounded-md border border-warn/30 bg-warn/10 px-3 py-2 text-[12px] text-warn">
                 {{ seg.warning }}
               </p>
+              <div v-else-if="seg.kind === 'scope_blocked'" class="flex items-center gap-2 text-[11px] text-dim-2">
+                <span class="rounded-full border border-border-soft px-1.5 py-0.5 font-mono text-[9.5px] uppercase tracking-wide">Off-topic</span>
+                <span>Refused before running — outside SAGE's scope</span>
+              </div>
             </div>
           </TransitionGroup>
 

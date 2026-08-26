@@ -61,6 +61,12 @@ run code, and do exact math — instead of guessing.
   each tagged symbol (valve type, instrument bubble, line type) against a
   fixed, documented legend — not a guess — then flags where the drawing
   doesn't actually match what the spec requires.
+- 🔀 **Cross-check a new finding against everything already on record** —
+  mention a measurement, setpoint, or compliance status for a specific piece
+  of equipment, and SAGE searches related SOPs *and* engineering
+  correspondence for that equipment before taking your word for it — a real
+  conflict gets a distinct flag, both in the Console and in any document it
+  drafts, not just buried in prose.
 - 💻 **Write and run code safely** — SAGE writes code (numpy/scipy available,
   nothing else — no network to install anything), runs it in a locked-down
   sandbox, checks the actual output against what was expected when there's a
@@ -439,6 +445,23 @@ control valve — the agent catches it, explains the real consequence (it
 can't provide the required fail-closed action), and flags it for escalation,
 the same "ground it, don't quietly trust either source" pattern as the
 inspection-report example above, applied to a drawing instead of text.
+
+**7. Catch a new finding that contradicts what's already on record**
+
+> *"The latest UT thickness reading for Vessel V-2201 came back at 9.8 mm.
+> Check this against our records and let me know if there's anything I
+> need to be concerned about."*
+
+The agent doesn't just answer from the number you gave it — it searches for
+related SOPs *and engineering correspondence* on that specific vessel,
+finds that a fitness-for-service memo set V-2201's minimum allowable wall
+thickness at 10.5 mm, and flags the conflict explicitly (a distinct red
+banner in the Console, not just another line of text) with the exact
+clause and the required escalation steps. Ask about a reading that's
+actually fine (say, 11.2 mm) and it correctly finds no conflict — while
+still catching a real, more subtle secondary requirement (a "within 10% of
+the minimum" review trigger) rather than just pattern-matching on "is this
+number near a limit."
 
 ### Common issues
 

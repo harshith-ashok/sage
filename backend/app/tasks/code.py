@@ -22,6 +22,7 @@ from typing import Callable, TypedDict
 from langchain_core.messages import HumanMessage
 from langgraph.graph import END, StateGraph
 
+from app.complexity import classify_complexity
 from app.model_warmup import invoke_with_retry
 from app.router import get_chat_model
 from app.tasks.sandbox import run_python
@@ -45,6 +46,7 @@ GENERATE_SYSTEM_PROMPT = (
 class CodeTaskState(TypedDict):
     task: str
     expected_output: str | None
+    tier: str
     code: str
     stdout: str
     stderr: str
@@ -70,7 +72,7 @@ def _strip_code_fence(text: str) -> str:
 
 
 def generate_node(state: CodeTaskState) -> dict:
-    model = get_chat_model("coding")
+    model = get_chat_model("coding", tier=state.get("tier"))
     retry_note = (
         f"\n\nThe previous attempt was rejected:\n```\n{state['code']}\n```\n"
         f"stdout was:\n{state['stdout']!r}\nstderr was:\n{state['stderr']!r}\n"
@@ -160,9 +162,16 @@ _NODE_EVENTS = {
 
 
 def run_code_task(task: str, expected_output: str | None, emit: Callable[[str, dict], None]) -> None:
+    # Phase 11: complexity-based tiering for the coding subtask, same
+    # heuristic and same reasoning as app/agent.py's own tiering of the
+    # outer reasoning turn (see app/complexity.py) — a second real
+    # "subtask" example, not just the top-level chat model.
+    tier = classify_complexity(task)
+    emit("tier_selected", {"task_type": "coding", "tier": tier})
     initial: CodeTaskState = {
         "task": task,
         "expected_output": expected_output,
+        "tier": tier,
         "code": "",
         "stdout": "",
         "stderr": "",

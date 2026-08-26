@@ -17,6 +17,7 @@ dependencies = [
     "ollama>=0.6.2",
     "openpyxl>=3.1.5",
     "pillow>=12.3.0",
+    "psutil>=7.2.2",
     "pydantic>=2.13.4",
     "pymupdf4llm>=1.28.2",
     "pytest>=9.1.1",

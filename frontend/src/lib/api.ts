@@ -47,6 +47,22 @@ export async function apiPostForm<T>(path: string, form: FormData): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** POST JSON, expecting a binary response (Phase 13's zip export) — returns
+ * the raw Blob rather than parsing JSON, since the caller wants to trigger
+ * a file save, not read a value. */
+export async function apiPostBlob(path: string, body: unknown): Promise<Blob> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new ApiError(detail?.detail ?? res.statusText, res.status);
+  }
+  return res.blob();
+}
+
 /**
  * Opens an SSE stream at `path`, dispatching each named event in `handlers`
  * (event name -> parsed-JSON-data callback). Returns the EventSource so the

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from qdrant_client import QdrantClient
 from sentence_transformers import CrossEncoder
 
+from app.hf_cache import is_fully_cached
 from app.knowledge.config import QDRANT_URL, RERANKER_MODEL_NAME
 
 
@@ -22,5 +23,8 @@ class PipelineDependencies:
     def build(cls) -> "PipelineDependencies":
         return cls(
             client=QdrantClient(url=QDRANT_URL),
-            reranker=CrossEncoder(RERANKER_MODEL_NAME),
+            # Phase 12: offline once cached — see app/hf_cache.py. CrossEncoder
+            # doesn't take local_files_only itself; its own **kwargs pass
+            # through to the underlying transformers from_pretrained call.
+            reranker=CrossEncoder(RERANKER_MODEL_NAME, local_files_only=is_fully_cached(RERANKER_MODEL_NAME)),
         )

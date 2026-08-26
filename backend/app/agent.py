@@ -25,6 +25,8 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
 
+from app.complexity import classify_complexity
+from app.scope_guard import REFUSAL_MESSAGE, is_in_scope
 from app.knowledge.query import format_context, retrieve_context
 from app.router import get_chat_model
 from app.tasks.calculate import CalculationError
@@ -70,6 +72,14 @@ SYSTEM_PROMPT = (
     "- Never state what an SOP/procedure requires from memory — search for it, and "
     "cite the specific (Page X, Section Y) each claim came from.\n"
     "- Never claim code works without actually running it via `run_sandboxed_code`.\n"
+    "- If the user reports a new finding, measurement, or reading (a thickness, a pressure, "
+    "a recorded interval, a compliance status) tied to specific equipment, call "
+    "`check_cross_document_contradictions` before treating it as fine — it retrieves related "
+    "SOPs and engineering correspondence on that equipment so you can check for a numeric or "
+    "policy conflict, not just answer from the finding alone. If it finds one, mark that part "
+    "of your answer with the literal text '⚠️ CONFLICT:' (the Console highlights this marker) "
+    "and state exactly what conflicts and its source — do this in a drafted document too if "
+    "you're writing one, as its own clearly labeled section.\n"
     "- Never eyeball or guess a statistical result (a trend, a correlation, a "
     "cluster grouping, a dimensionality reduction) — fit a real model with the "
     "appropriate ML tool (fit_linear_regression/fit_logistic_regression/kmeans_cluster/"
@@ -109,7 +119,13 @@ SYSTEM_PROMPT = (
 )
 
 
-def _make_tools(image_b64: str | None, audio_path: str | None = None, document_text: str | None = None) -> list:
+def _make_tools(
+    image_b64: str | None,
+    audio_path: str | None = None,
+    document_text: str | None = None,
+    emit: Callable[[str, dict], None] | None = None,
+    include_knowledge_base: bool = True,
+) -> list:
     @tool
     def search_knowledge_base(query: str) -> str:
         """Search the site's SOP/procedure knowledge base. Returns the raw retrieved excerpts with their (Page, Section) location, NOT a pre-written answer — read them yourself and cite the specific ones you rely on. A single narrow query can miss a relevant clause elsewhere in the same document, so search again with different wording if the first result doesn't seem to cover the full picture (e.g. it mentions a procedure but not what to do if that procedure's finding is severe)."""
@@ -117,6 +133,20 @@ def _make_tools(image_b64: str | None, audio_path: str | None = None, document_t
         if not candidates:
             return "No relevant excerpts found in the knowledge base for this query."
         return format_context(candidates)
+
+    @tool
+    def check_cross_document_contradictions(finding: str) -> str:
+        """Check a new finding/measurement/claim against the knowledge base for numeric or policy conflicts with related SOPs or engineering correspondence on the same equipment/topic. Pass a short, specific factual statement (e.g. "Vessel V-2201 current wall thickness reading: 9.8 mm" or "PSV-2201 recertification interval logged as 24 months") — retrieves the related excerpts (same tag/topic) for you to compare it against. Use this before finalizing any report, note, or answer that states a measurement, setpoint, interval, or compliance status, not only once something already looks suspicious — a real conflict is exactly the kind of thing that doesn't look suspicious until it's checked against the record."""
+        candidates = retrieve_context(finding, top_k=6)
+        if not candidates:
+            return "No related SOP or correspondence found in the knowledge base to cross-check this finding against."
+        return (
+            "Related excerpts — read them and explicitly decide whether there's a numeric/policy "
+            f"conflict with the finding (\"{finding}\") or it's consistent with the record. If there IS a "
+            "conflict, start that part of your answer with the exact literal marker '⚠️ CONFLICT:' "
+            "followed by what conflicts and the specific source it conflicts with — this marker is what "
+            "makes the Console visually flag it, so don't paraphrase it away.\n\n" + format_context(candidates)
+        )
 
     @tool
     def read_uploaded_image(instructions: str = "Transcribe everything in the image in full, preserving field/value pairs.") -> str:
@@ -167,10 +197,31 @@ def _make_tools(image_b64: str | None, audio_path: str | None = None, document_t
         return model.invoke([message]).content
 
     @tool
-    def run_sandboxed_code(task: str, expected_output: str | None = None) -> str:
-        """Write and run Python code in a network-isolated Docker sandbox (numpy/scipy pre-installed; no other packages, no network). Use for anything that needs real code execution, not a guessed answer. Pass expected_output when you know the exact correct stdout (e.g. a specific number) — it's verified as an exact match and retried on mismatch. Leave it unset for open-ended/analytical code (e.g. fitting a model, exploring data) where there's no single correct printed string — it's instead just verified as having actually run without error."""
+    def run_sandboxed_code(task: str, expected_output: str | int | float | bool | list | None = None) -> str:
+        """Write and run Python code in a network-isolated Docker sandbox (numpy/scipy pre-installed; no other packages, no network). Use for anything that needs real code execution, not a guessed answer. Pass expected_output when you know the exact correct stdout (e.g. a specific number or list) — it's verified as an exact match against the script's printed output and retried on mismatch. Leave it unset for open-ended/analytical code (e.g. fitting a model, exploring data) where there's no single correct printed string — it's instead just verified as having actually run without error."""
+        # The model naturally reaches for a real Python value here (e.g. a
+        # list for "the first 10 primes"), not always a string — caught
+        # live: `expected_output=[2, 3, 5, ...]` crashed with a Pydantic
+        # validation error before this function body ever ran, the same
+        # class of bug as Phase 7's ML-tool flat-list issue. Verification
+        # is always a stdout *string* match (run_code_task/verify_node), so
+        # normalize here via str() — for a plain list/number this produces
+        # exactly what Python's own print() would output (e.g.
+        # "[2, 3, 5, 7]"), matching what a script doing `print(the_value)`
+        # actually prints.
+        expected_str = expected_output if expected_output is None or isinstance(expected_output, str) else str(expected_output)
         events: list[tuple[str, dict]] = []
-        run_code_task(task, expected_output, lambda event, data: events.append((event, data)))
+
+        def _collect(event: str, data: dict) -> None:
+            events.append((event, data))
+            # Forward just the tier choice out to the outer trace — the
+            # coding subtask's own generate/execute/verify steps are
+            # already summarized in this tool's own return value, so only
+            # the tiering decision (Phase 11) is worth surfacing separately.
+            if event == "tier_selected" and emit is not None:
+                emit(event, data)
+
+        run_code_task(task, expected_str, _collect)
         done = next((data for event, data in reversed(events) if event == "done"), {})
         status = "PASSED" if done.get("passed") else "FAILED after retries"
         return f"{status}\n\n```python\n{done.get('code', '')}\n```\n\nOutput:\n```\n{done.get('stdout', '')}\n```"
@@ -291,8 +342,16 @@ def _make_tools(image_b64: str | None, audio_path: str | None = None, document_t
             return document_text[:MAX_DOCUMENT_CHARS] + f"\n\n[...truncated, {len(document_text) - MAX_DOCUMENT_CHARS} more characters not shown]"
         return document_text
 
+    # Acceptance checklist: "Knowledge base grounding: turn it off, confirm
+    # the answer changes" — the tools simply aren't offered to the model at
+    # all when disabled, not hidden behind a prompt instruction it could
+    # ignore. Without them, an answer that depended on the SOP corpus comes
+    # from the model's own general knowledge instead — a real, checkable
+    # difference, not a cosmetic one.
+    knowledge_base_tools = [search_knowledge_base, check_cross_document_contradictions] if include_knowledge_base else []
+
     return [
-        search_knowledge_base,
+        *knowledge_base_tools,
         read_uploaded_image,
         read_pid_drawing,
         run_sandboxed_code,
@@ -338,6 +397,7 @@ def run_agent(
     audio_path: str | None = None,
     document_text: str | None = None,
     thread_id: str | None = None,
+    use_knowledge_base: bool = True,
 ) -> None:
     """Drives the agent via .stream() on two combined stream modes, so the
     reply streams token-by-token instead of waiting for each full message:
@@ -351,8 +411,32 @@ def run_agent(
     the same id as a prior call resumes that conversation (the model sees
     its own earlier messages, not just this one), omitting it starts a
     stateless one-off turn with no memory, same as before this existed."""
-    model = get_chat_model("reasoning")
-    tools = _make_tools(image_b64, audio_path, document_text)
+    has_attachment = bool(image_b64 or audio_path or document_text)
+
+    # Topic guardrail (app/scope_guard.py): a hard gate, not a prompt
+    # instruction the model could just ignore — an out-of-scope request
+    # never reaches create_react_agent, so no tool ever runs and nothing
+    # gets generated for it. Checked before tiering/model warm-up on
+    # purpose: if this is going to refuse, there's no reason to do that
+    # work first. A refused turn is never added to `thread_id`'s LangGraph
+    # message history (the graph is never invoked for it) — there's no
+    # real reasoning trace to persist, just a canned refusal.
+    if not is_in_scope(prompt, has_attachment):
+        emit("scope_blocked", {})
+        message_id = str(uuid.uuid4())
+        emit("message", {"id": message_id, "content": REFUSAL_MESSAGE})
+        emit("done", {"content": REFUSAL_MESSAGE})
+        return
+
+    # Phase 11: complexity-based tiering — a cheap heuristic on the prompt
+    # (app/complexity.py), not an extra model call, picks "fast" vs
+    # "strong" once per turn before the model is even resolved, so this
+    # adds no latency of its own on top of the model call that was always
+    # going to happen.
+    tier = classify_complexity(prompt, has_attachment=has_attachment)
+    model = get_chat_model("reasoning", tier=tier)
+    emit("tier_selected", {"task_type": "reasoning", "tier": tier, "model_id": model.model})
+    tools = _make_tools(image_b64, audio_path, document_text, emit=emit, include_knowledge_base=use_knowledge_base)
     graph = create_react_agent(model, tools, prompt=SYSTEM_PROMPT, checkpointer=_checkpointer)
     config = {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
 

@@ -25,6 +25,7 @@ class ModelCandidate(BaseModel):
     location: str  # "local" | "cloud"
     context_window: int
     engine: str = "ollama"  # "ollama" (default, served via app/router.py) | "transformers" (loaded directly — Phase 8's IndicTrans2)
+    tier: str | None = None  # "fast" | "strong" | None (Phase 11: complexity-based routing, app/complexity.py) — None means this candidate isn't part of that scheme, same as before it existed
 
 
 class TaskTypeConfig(BaseModel):

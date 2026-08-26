@@ -29,8 +29,42 @@
 }
 
 @theme {
-  /* Neutral dark palette + one accent (blue) — deliberately not a purple/
-     violet AI-template gradient. */
+  /* Neutral palette + one accent (blue) — deliberately not a purple/violet
+     AI-template gradient. Values here are the LIGHT theme (the default —
+     see the `:root[data-theme="dark"]` override block below for dark,
+     and main.ts for how the active theme is chosen/persisted). Every
+     component references these tokens (bg-bg, text-text, border-border,
+     ...), never a raw hex, so a theme switch is purely these variables
+     changing — no component markup depends on which theme is active. */
+  --color-bg: #f6f7f9;
+  --color-panel: #ffffff;
+  --color-panel-2: #eef0f3;
+  --color-border: #dde1e7;
+  --color-border-soft: #e8eaee;
+  --color-text: #1a1d24;
+  --color-dim: #676d78;
+  --color-dim-2: #99a0ab;
+  --color-accent: #3763e0;
+  --color-accent-ink: #ffffff;
+  --color-ok: #1a8f57;
+  --color-warn: #b1740a;
+  --color-danger: #cf3f37;
+  --shadow-card: 0 1px 2px rgba(20, 24, 32, 0.04), 0 1px 1px rgba(20, 24, 32, 0.03);
+  --shadow-pop: 0 8px 24px rgba(20, 24, 32, 0.1), 0 2px 6px rgba(20, 24, 32, 0.06);
+
+  /* Deliberate type pairing: Space Grotesk for display/headings, Inter for
+     body copy, JetBrains Mono for data/labels/model ids. */
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+}
+
+/* Dark theme — wins whenever `data-theme="dark"` is set on <html> (see
+   main.ts: explicit user choice, persisted; falls back to the OS
+   preference on first visit, same as the light values above fall back to
+   it too). Every token from the block above is redeclared here; nothing
+   is dark-only or light-only. */
+:root[data-theme="dark"] {
   --color-bg: #0a0c10;
   --color-panel: #12151b;
   --color-panel-2: #171b22;
@@ -40,15 +74,12 @@
   --color-dim: #8a9099;
   --color-dim-2: #565c66;
   --color-accent: #5b8cff;
+  --color-accent-ink: #0a0c10;
   --color-ok: #37c978;
   --color-warn: #e8a33d;
   --color-danger: #f0665c;
-
-  /* Deliberate type pairing: Space Grotesk for display/headings, Inter for
-     body copy, JetBrains Mono for data/labels/model ids. */
-  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.25), 0 1px 1px rgba(0, 0, 0, 0.2);
+  --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
 * {
@@ -147,10 +178,18 @@ h3 {
   border-radius: 4px;
   padding: 0.1em 0.35em;
 }
+/* Fenced code blocks stay a fixed dark "terminal" look in both app themes
+   (a deliberate choice, not an oversight — matches the github-dark-dimmed
+   hljs theme imported above, whose span colors assume a dark background;
+   swapping to a light hljs theme in light mode would need a second
+   stylesheet loaded and conditionally applied for comparatively little
+   benefit). Uses fixed literal colors here, not the --color-* tokens,
+   specifically so it *doesn't* follow the active theme the way everything
+   else in this file does. */
 .markdown-body pre {
   margin: 0 0 0.6em;
   border-radius: 8px;
-  border: 1px solid var(--color-border);
+  border: 1px solid #2a2f3a;
   overflow: hidden;
   position: relative;
 }
@@ -167,8 +206,19 @@ h3 {
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.55;
-  background: var(--color-panel-2) !important;
+  background: #171b22 !important;
   cursor: pointer;
+}
+/* Same fixed-dark reasoning as .markdown-body pre above, for the one place
+   a code block renders outside .markdown-body entirely (CodeModal.vue's
+   popup). */
+.sage-code-surface {
+  background: #171b22;
+  border-color: #2a2f3a !important;
+  color: #9aa4b2;
+}
+.sage-code-surface button:hover {
+  color: #f2f4f7;
 }
 .markdown-body pre::after {
   content: "expand ⤢";
@@ -179,9 +229,9 @@ h3 {
   font-size: 9.5px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: var(--color-dim-2);
-  background: var(--color-panel);
-  border: 1px solid var(--color-border-soft);
+  color: #7a8190;
+  background: #12151b;
+  border: 1px solid #242a33;
   border-radius: 4px;
   padding: 1px 6px;
   opacity: 0;

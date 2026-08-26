@@ -4,43 +4,68 @@ app/router.py but still reads its two model_ids from the same
 config/models.yaml registry via app.config.get_active_candidate(), same as
 every other model in this project.
 
-Four separate transformers-5.x compatibility shims live at the top of this
-file, all for the same underlying reason: this project can't pin
-transformers down (sentence-transformers, Phase 3's reranker, already
-requires >=5), but IndicTrans2's own tooling — both the pip package and the
-model's own `trust_remote_code=True` config/tokenizer/model code hosted on
-HuggingFace — still assumes an older transformers layout. Each was found by
-actually running a real translation with a real, authenticated HF_TOKEN and
-reading the next traceback, not guessed at.
+Six transformers-5.x compatibility shims live at the top of this file, all
+for the same underlying reason: this project can't pin transformers down
+(sentence-transformers, Phase 3's reranker, already requires >=5), but
+IndicTrans2's own tooling — both the pip package and the model's own
+`trust_remote_code=True` config/tokenizer/model code hosted on HuggingFace —
+still assumes an older transformers layout. Each was found by actually
+running a real translation with a real, authenticated HF_TOKEN and reading
+the next traceback (or, in the end, inspecting real output), not guessed
+at.
 
-**STILL NOT WORKING END TO END**, honestly: with all four shims applied,
-loading gets all the way through tokenizer + model construction + weight
-tying, and `.generate()` starts running real inference — further than any
-previous session got. It then fails inside the remote model's own custom
-self-attention forward() at `torch.cat([past_key_value[0], key_states],
-dim=2)`, a shape mismatch. Root cause: this remote code's hand-written
-attention layers manually concatenate past/new key-value tensors assuming
-the old tuple-cache's empty state was a real, correctly-shaped 4D tensor;
-transformers 5.x's Cache-object equivalent reports `None` for an untouched
-layer instead, and a same-shaped placeholder isn't obviously constructible
-from outside the attention layer (its batch size/head count/head dim aren't
-known at the point the cache is queried). This is no longer a simple
-"missing import/method/kwarg" gap like the four shims below — it's the
-remote model's own low-level attention math not matching the new Cache
-object model at a structural level, and further blind patching risks
-producing translations that run without crashing but are silently wrong
-(already caught once: disabling caching entirely avoided this exact crash
-but produced empty output for every input, with no error at all). Stopped
-here rather than keep guessing at tensor shapes with no way to verify
-correctness short of a fluent speaker checking the output. The four shims
-below are real, verified, and worth keeping regardless — they're not wasted
-effort, they got this from "won't import" to "runs real inference,
-crashes deep inside custom attention code" — but actual translation output
-is not yet achievable without either patching this specific model's
-attention implementation properly (a bigger, riskier undertaking) or
-running this one path against an isolated older transformers install.
+**NOW WORKING END TO END, verified with real output**: `translate_from_english`
+and `translate_to_english` produce fluent, correct translations for
+en<->hi/ta/te (spot-checked: "The pressure reading is normal." round-trips
+through Hindi and back to the identical English sentence; Tamil/Telugu
+outputs read as correct, fluent sentences, not garbage or empty strings).
+Getting here took six distinct, independently-discovered incompatibilities
+— import paths (shims 1-2), tokenizer init ordering (shim 3), weight tying
+(shims 4a-4b), attention branch logic (shim 4d) and KV-cache lifecycle
+(shims 4c/4e/4f), and finally a completely unrelated bug in position
+embeddings (shim 4g) that turned out to be the last mile:
+
+- Shims 4d (stale `elif past_key_value is not None:` branch — old code
+  meant "is there real cached data", but the new Cache-object API always
+  passes a non-None object even when empty) and 4e (this remote model
+  builds its own legacy nested-tuple KV-cache internally and never calls
+  `.update()` on the real Cache object it's handed — bridged by writing
+  its computed tensors into that object's layers directly) got `.generate()`
+  running without crashing, but production was still empty for a while
+  after each fix — a real, demonstrated failure mode (silently wrong output,
+  no exception) that reproduced independently three separate times across
+  this investigation, which is why each fix here was verified against real
+  decoded text, not just "did it stop crashing".
+- Shim 4c's `EncoderDecoderCache.__getitem__` initially just reused the
+  class's own (real, already-existing) `__iter__`, which yields a 6-tuple
+  per layer (`self_k, self_v, self_sliding, cross_k, cross_v,
+  cross_sliding`) — but the remote model's decoder layer code was written
+  for the *old* 4-tuple legacy format and slices `past_key_value[-2:]` for
+  cross-attention, which against a 6-tuple silently grabs
+  `(cross_v, cross_sliding)` instead of `(cross_k, cross_v)`. Fixed by
+  building the legacy 4-tuple directly from each sub-cache's own layers.
+- Shim 4f bridges beam search's own `_reorder_cache` call (the model's
+  legacy-tuple-shaped override crashes on a real Cache object, which
+  already has its own correct `.reorder_cache()` — delegate to it instead).
+- **Shim 4g, the actual last blocker**: with generation running cleanly and
+  beam search reordering correctly, real output was *still* empty — traced
+  to something with nothing to do with caching at all: the encoder's own
+  hidden states were NaN from its very first layer. Root cause: this
+  model's `IndicTransSinusoidalPositionalEmbedding` computes a real
+  sinusoidal position table once in `__init__` and stores it as a
+  *non-persistent* buffer (deliberately excluded from the checkpoint, since
+  it's pure deterministic math, not learned). transformers 5.x's
+  `from_pretrained` initializes the whole model on the meta device by
+  default, then re-materializes any non-persistent buffer via
+  `torch.empty_like(buffer, ...)` — genuinely uninitialized memory, not a
+  recomputation, confirmed by reading `_move_missing_keys_from_meta_to_device`
+  in `modeling_utils.py` and by the buffer's actual values (tiny
+  denormalized garbage with scattered NaN — the signature of uninitialized
+  memory). Fixed by forcing every such buffer to recompute for real
+  immediately after loading, via the model's own `make_weights()` method.
 """
 
+import functools as _functools
 import sys
 import threading
 import types
@@ -153,11 +178,18 @@ import inspect
 
 from transformers.modeling_utils import PreTrainedModel as _PTM
 
-_original_init_subclass = _PTM.__init_subclass__
+# .__func__: accessing a classmethod via PreTrainedModel.__init_subclass__
+# binds it to PreTrainedModel itself, not to whichever subclass is actually
+# being defined when this runs later — calling that bound version with only
+# **kwargs would silently run every chained check against the wrong class.
+# The raw function, called with cls passed through explicitly, doesn't have
+# that problem. (Caught live: Shim 4e chaining through this exact capture
+# the naive way caused tie_weights patching to silently stop working.)
+_original_init_subclass = _PTM.__init_subclass__.__func__
 
 
 def _tie_weights_compat_init_subclass(cls, **kwargs) -> None:
-    _original_init_subclass(**kwargs)
+    _original_init_subclass(cls, **kwargs)
     method = cls.__dict__.get("tie_weights")
     if method is None:
         return
@@ -214,43 +246,221 @@ if not hasattr(_PTM, "_tie_or_clone_weights"):
 # Shim 4c/4 — with tie_weights fixed, model loading finishes, but the remote
 # forward() itself does `past_key_values[0][0].shape[2]` — old tuple-style
 # KV-cache access (`[layer][key_or_value]`). transformers 5.x replaced the
-# plain-tuple cache with `Cache`/`EncoderDecoderCache` objects, which support
-# iteration (yielding one tuple per layer — see EncoderDecoderCache.__iter__)
-# but not integer indexing. First tried disabling caching outright
-# (`use_cache=False`) to sidestep the whole codepath — that avoided the
-# crash but silently produced degenerate output (immediate EOS, empty
-# translations for every input), so caching is actually load-bearing for
-# this model's generation quality, not just a performance nicety. Adding
-# `__getitem__` (delegating to the existing `__iter__`) instead of disabling
-# caching preserves real KV-cache behavior while satisfying the remote
-# code's old-style access pattern.
+# plain-tuple cache with `Cache`/`EncoderDecoderCache` objects. First tried
+# disabling caching outright (`use_cache=False`) to sidestep the whole
+# codepath — that avoided the crash but silently produced degenerate output
+# (immediate EOS, empty translations for every input), so caching is
+# actually load-bearing for this model's generation quality, not just a
+# performance nicety. Added `__getitem__` instead of disabling caching, to
+# preserve real KV-cache behavior while satisfying the remote code's
+# old-style `past_key_values[idx]` access pattern.
+#
+# IMPORTANT: this can't just delegate to `EncoderDecoderCache.__iter__` —
+# that already exists on this transformers version, but yields a *6-tuple*
+# per layer (`self_k, self_v, self_sliding, cross_k, cross_v, cross_sliding`
+# — confirmed by reading its actual source). The remote model's decoder
+# layer code was written for the old legacy format, a *4-tuple*
+# `(self_k, self_v, cross_k, cross_v)`, and slices it accordingly:
+# `past_key_value[:2]` for self-attention (still correct against a 6-tuple,
+# happens to grab the same first two elements) but `past_key_value[-2:]`
+# for cross-attention — against a 6-tuple this grabs `(cross_v,
+# cross_sliding)` instead of `(cross_k, cross_v)`. That silently fed the
+# wrong tensor in as cross-attention's *value* (an empty sliding-window
+# placeholder), which is exactly what produced
+# `RuntimeError: Expected size for first two dimensions of batch2 tensor to
+# be: [8, 9] but got: [8, 0]` inside `torch.bmm` during real (non-beam)
+# generation. Fixed by building the legacy 4-tuple directly from each
+# sub-cache's own layers instead of reusing `__iter__`'s 6-tuple shape.
 import torch as _torch
 from transformers.cache_utils import EncoderDecoderCache as _EDC
 
 if not hasattr(_EDC, "__getitem__"):
 
-    def _encoder_decoder_cache_getitem(self, layer_idx: int):
-        layer = tuple(self)[layer_idx]
+    def _sub_cache_layer_kv(cache, layer_idx: int):
         # A layer that hasn't been written to yet (the very first forward
-        # pass, before any decoding step) reports None for its
-        # keys/values/sliding-window tensor — the remote code then does
-        # `past_key_values[0][0].shape[2]` unconditionally to read how many
-        # tokens are already cached, which crashes on None. Old-style
-        # tuple caches never had this problem (an empty cache was just
-        # `None` at the top level, checked with `is not None`); the new
-        # object-based cache is non-None even when empty, so that check no
-        # longer catches this case. A zero-length placeholder tensor makes
-        # `.shape[2]` read as 0, matching what the old cache semantics
-        # actually meant by "nothing cached yet".
-        return tuple(t if t is not None else _torch.empty(0, 0, 0, 0) for t in layer)
+        # pass, before any decoding step, or a sub-cache — e.g. cross-attn
+        # on step 1 — with fewer populated layers than others) has no
+        # entry at all, or reports None for keys/values. The remote code
+        # then does `past_key_values[0][0].shape[2]` unconditionally to
+        # read how many tokens are already cached, which crashes on None.
+        # Old-style tuple caches never had this problem (an empty cache was
+        # just `None` at the top level, checked with `is not None`); the
+        # new object-based cache is non-None even when empty, so that check
+        # no longer catches this case. A zero-length placeholder tensor
+        # makes `.shape[2]` read as 0, matching what the old cache
+        # semantics actually meant by "nothing cached yet".
+        if layer_idx >= len(cache.layers):
+            return (_torch.empty(0, 0, 0, 0), _torch.empty(0, 0, 0, 0))
+        layer = cache.layers[layer_idx]
+        keys = layer.keys if layer.keys is not None else _torch.empty(0, 0, 0, 0)
+        values = layer.values if layer.values is not None else _torch.empty(0, 0, 0, 0)
+        return (keys, values)
+
+    def _encoder_decoder_cache_getitem(self, layer_idx: int):
+        self_k, self_v = _sub_cache_layer_kv(self.self_attention_cache, layer_idx)
+        cross_k, cross_v = _sub_cache_layer_kv(self.cross_attention_cache, layer_idx)
+        return (self_k, self_v, cross_k, cross_v)
 
     _EDC.__getitem__ = _encoder_decoder_cache_getitem
+
+# Shim 4d/4 — even with 4c's placeholder, generation still crashed:
+# `RuntimeError: Sizes of tensors must match except in dimension 2. Expected
+# size 0 but got size 5...` inside the remote attention forward()'s
+# `torch.cat([past_key_value[0], key_states], dim=2)`. Read the cached
+# `modeling_indictrans.py` directly to find the real cause — not a shape bug
+# in the placeholder (its dim 2 being 0 was already correct), but stale
+# *branch logic*: `elif past_key_value is not None:` (three occurrences —
+# encoder self-attn, decoder self-attn, an alternate attention backend
+# variant) used to mean "is there real cached data to concatenate with",
+# back when the old tuple-cache was literally `None` until the first token
+# was generated. Under the new Cache-object API a real (non-None) cache is
+# passed in from the very first forward pass, before anything is cached, so
+# that `is not None` check no longer distinguishes "empty cache" from
+# "populated cache" — it always takes the "reuse and concatenate" branch,
+# even when there's a zero-length placeholder (from 4c) with nothing real
+# to concatenate. Confirmed live that the *cross*-attention equivalent check
+# a few lines above doesn't have this bug: it already compares
+# `past_key_value[0].shape[2] == key_value_states.shape[1]`, which
+# correctly evaluates false for an empty (shape[2]==0) cache — only the
+# self-attention branch is missing that same guard. Fixed by adding it,
+# patched directly into the cached file's source (post-download, pre-import
+# — get_class_in_module is what actually exec()s these files) rather than
+# from outside: the bug is in the branch *condition* itself, which can't be
+# changed by wrapping/patching methods after the fact the way shims 1-4c
+# could. No-ops safely for every other cached remote-code file (the child
+# text has to already be present to be replaced) and is naturally
+# idempotent (replacing already-patched text finds nothing left to match).
+import transformers.dynamic_module_utils as _dmu
+
+_original_get_class_in_module = _dmu.get_class_in_module
+_BROKEN_REUSE_CHECK = "elif past_key_value is not None:"
+_FIXED_REUSE_CHECK = "elif past_key_value is not None and past_key_value[0].shape[2] > 0:"
+
+
+def _patch_stale_kv_cache_check(module_file) -> None:
+    try:
+        text = module_file.read_text()
+    except OSError:
+        return
+    if _BROKEN_REUSE_CHECK in text:
+        module_file.write_text(text.replace(_BROKEN_REUSE_CHECK, _FIXED_REUSE_CHECK))
+
+
+def _get_class_in_module_with_kv_cache_patch(class_name, module_path, **kwargs):
+    from pathlib import Path
+
+    _patch_stale_kv_cache_check(Path(_dmu.HF_MODULES_CACHE) / module_path)
+    return _original_get_class_in_module(class_name, module_path, **kwargs)
+
+
+_dmu.get_class_in_module = _get_class_in_module_with_kv_cache_patch
+
+# Shim 4e/4 — with 4d's branch-logic fix, generation runs without crashing
+# but returns instantly (`[2, 2]`, immediate EOS — empty output for every
+# input, no error). Traced the real cause by reading the decoder's own
+# forward() loop directly: this remote model builds its *own* hand-written
+# legacy nested-tuple KV-cache internally (`next_decoder_cache += (...)`,
+# one (self_k, self_v, cross_k, cross_v) tuple per layer) and returns it as
+# `outputs.past_key_values` — but never calls `.update()` on the real
+# EncoderDecoderCache object generate() handed it. So nothing this model
+# computes during decoding is ever visible to the *next* decoding step:
+# every step effectively starts over with an empty cache and no memory of
+# prior tokens, which is exactly what produces immediate-EOS degenerate
+# output rather than a crash. transformers itself used to ship
+# `from_legacy_cache`/`to_legacy_cache` conversion helpers for exactly this
+# legacy-format gap; both are fully removed in the installed version, so
+# this reimplements the specific direction needed (legacy tuple -> write
+# into a real Cache object) rather than a general bidirectional converter.
+#
+# Hooked onto the *same* `PreTrainedModel.__init_subclass__` chain as Shim
+# 4a (chaining through its already-patched state, not undoing it) — wraps
+# any dynamically-loaded model class's own `forward()` to, after each real
+# call, check whether it returned a legacy plain-tuple cache while it was
+# actually handed a real Cache object to keep updated; if so, write the
+# legacy tuple's tensors into that Cache object's layers directly (replacing
+# each layer's stored tensors wholesale, not appending — this model's own
+# tensors are already the full accumulated sequence via its internal
+# torch.cat, not an incremental delta) and substitute the real, now-updated
+# Cache object back into the output in place of the legacy tuple. Self-limiting
+# by construction: a model that already returns a proper Cache object (i.e.
+# every other, unaffected model in this app) hits the `isinstance` guard and
+# this becomes a no-op passthrough.
+from transformers.cache_utils import Cache as _Cache
+
+
+def _write_legacy_cache_into_encoder_decoder_cache(legacy_cache, target: _EDC) -> None:
+    for layer_idx, layer in enumerate(legacy_cache):
+        _replace_dynamic_cache_layer(target.self_attention_cache, layer_idx, layer[0], layer[1])
+        if len(layer) > 2 and layer[2] is not None:
+            _replace_dynamic_cache_layer(target.cross_attention_cache, layer_idx, layer[2], layer[3])
+
+
+def _replace_dynamic_cache_layer(cache, layer_idx: int, keys, values) -> None:
+    while len(cache.layers) <= layer_idx:
+        cache.layers.append(cache.layer_class_to_replicate())
+    cache.layers[layer_idx].keys = keys
+    cache.layers[layer_idx].values = values
+
+
+# .__func__ again — see Shim 4a's comment on why the bound-classmethod
+# version can't be chained through correctly.
+_previous_init_subclass = _PTM.__init_subclass__.__func__  # already Shim 4a's patched version — chained, not replaced
+
+
+def _cache_writeback_compat_init_subclass(cls, **kwargs) -> None:
+    _previous_init_subclass(cls, **kwargs)
+    forward = cls.__dict__.get("forward")
+    if forward is not None:
+
+        @_functools.wraps(forward)  # generate()'s own kwarg validation inspects forward's real
+        # signature (inspect.signature follows __wrapped__, which @wraps sets) — a bare
+        # `(self, *args, **kwargs)` wrapper hides the real parameter names transformers
+        # needs to see there, and generate() rejects every call before this even runs.
+        def _forward_with_cache_writeback(self, *args, **fwd_kwargs):
+            past_key_values = fwd_kwargs.get("past_key_values")
+            outputs = forward(self, *args, **fwd_kwargs)
+            returned_cache = getattr(outputs, "past_key_values", None)
+            if isinstance(past_key_values, _EDC) and returned_cache is not None and not isinstance(returned_cache, _Cache):
+                try:
+                    _write_legacy_cache_into_encoder_decoder_cache(returned_cache, past_key_values)
+                    outputs.past_key_values = past_key_values
+                except (AttributeError, IndexError, TypeError):
+                    pass  # leave outputs exactly as the model returned them if the legacy shape doesn't match what we expect
+            return outputs
+
+        cls.forward = _forward_with_cache_writeback
+
+    # Same idea, one level further: beam search calls the model's own
+    # `_reorder_cache(past_key_values, beam_idx)` to keep cached K/V aligned
+    # with which beams survived each step — another legacy-tuple-shaped
+    # method (`for past_state in layer_past: past_state.index_select(...)`)
+    # that crashes on a real Cache object (some of its per-layer entries,
+    # e.g. an unused sliding-window slot, are legitimately None, which the
+    # legacy iteration has no concept of skipping). Real Cache objects
+    # already carry their own correct, built-in `.reorder_cache()` — no
+    # need to reimplement it here, just route to it instead of the model's
+    # incompatible override when that's what we're holding.
+    reorder_cache = cls.__dict__.get("_reorder_cache")
+    if reorder_cache is not None:
+
+        @_functools.wraps(reorder_cache)
+        def _reorder_cache_with_bridge(self, past_key_values, beam_idx):
+            if isinstance(past_key_values, _Cache):
+                past_key_values.reorder_cache(beam_idx)
+                return past_key_values
+            return reorder_cache(self, past_key_values, beam_idx)
+
+        cls._reorder_cache = _reorder_cache_with_bridge
+
+
+_PTM.__init_subclass__ = classmethod(_cache_writeback_compat_init_subclass)
 
 import torch
 from IndicTransToolkit import IndicProcessor
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from app.config import get_active_candidate
+from app.hf_cache import offline_kwargs
 
 # fastText lid.176 code -> IndicTrans2/FLORES-200 code, for the languages
 # named across Phase 8's bullets (Hindi/Tamil/Telugu/Kannada/Malayalam).
@@ -277,6 +487,36 @@ def _get_processor() -> IndicProcessor:
     return _processor
 
 
+def _repopulate_sinusoidal_position_buffers(model) -> None:
+    # Shim 4f/4 — even with generation running end to end (no crash), real
+    # output was still degenerate: the encoder's own hidden states were NaN
+    # from the very first layer, before any of the attention/cache machinery
+    # above even runs. Traced directly: this remote model's positional
+    # embedding class (`IndicTransSinusoidalPositionalEmbedding`) computes a
+    # real sinusoidal table once in `__init__` and stores it as a
+    # *non-persistent* buffer (`persistent=False` — deliberately excluded
+    # from the checkpoint, since it's pure math, not learned). But
+    # transformers 5.x's `from_pretrained` initializes the whole model on
+    # the meta device by default (confirmed by reading
+    # `_move_missing_keys_from_meta_to_device` in `modeling_utils.py`), and
+    # explicitly re-materializes any non-persistent buffer afterwards via
+    # `torch.empty_like(buffer, device=...)` — genuinely uninitialized
+    # memory, not a recomputation — because it has no checkpoint data to
+    # restore and no way to know the buffer was supposed to be
+    # deterministically computed rather than loaded. Confirmed empirically:
+    # the buffer's values were tiny denormalized garbage with scattered NaN,
+    # exactly the signature of uninitialized memory, not a real computation
+    # gone wrong. Older transformers versions didn't default to meta-device
+    # init for a non-quantized/non-distributed load, so this custom model's
+    # `__init__`-time computation used to just work. Fixed by forcing every
+    # such buffer to recompute for real immediately after loading — using
+    # the model's own `make_weights()` method, so it's the exact same math
+    # the model already trusts, not a reimplementation.
+    for module in model.modules():
+        if type(module).__name__ == "IndicTransSinusoidalPositionalEmbedding":
+            module.make_weights(module.weights.size(0), module.embedding_dim, module.padding_idx)
+
+
 def _get_model(task_type: str):
     """task_type is "translation_en_indic" or "translation_indic_en" —
     resolved via the model registry (app.config) exactly like every other
@@ -285,9 +525,12 @@ def _get_model(task_type: str):
     with _lock:
         if task_type not in _loaded:
             candidate = get_active_candidate(task_type)
-            tokenizer = AutoTokenizer.from_pretrained(candidate.model_id, trust_remote_code=True)
-            model = AutoModelForSeq2SeqLM.from_pretrained(candidate.model_id, trust_remote_code=True)
+            # Phase 12: offline once cached — see app/hf_cache.py.
+            offline = offline_kwargs(candidate.model_id)
+            tokenizer = AutoTokenizer.from_pretrained(candidate.model_id, trust_remote_code=True, **offline)
+            model = AutoModelForSeq2SeqLM.from_pretrained(candidate.model_id, trust_remote_code=True, **offline)
             model.eval()
+            _repopulate_sinusoidal_position_buffers(model)
             _loaded[task_type] = (tokenizer, model)
         return _loaded[task_type]
 

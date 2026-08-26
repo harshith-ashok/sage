@@ -15,12 +15,38 @@ export interface TaskTypeRegistry {
 
 export type ModelsRegistry = Record<string, TaskTypeRegistry>;
 
+// Phase 11: load-aware routing. Mirrors backend/app/load_monitor.py's
+// LoadSnapshot/FallbackEvent shapes, as returned by GET /system/load.
+export interface LoadedModel {
+  model_id: string;
+  size_bytes: number;
+  size_vram_bytes: number;
+}
+
+export interface FallbackEvent {
+  task_type: string;
+  from_model_id: string;
+  to_model_id: string | null;
+  reason: string;
+  timestamp: string;
+}
+
+export interface SystemLoad {
+  level: "normal" | "elevated" | "high";
+  available_percent: number;
+  loaded_models: LoadedModel[];
+  fallback_log: FallbackEvent[];
+}
+
 export const useModelsStore = defineStore("models", {
   state: () => ({
     registry: {} as ModelsRegistry,
     loading: false,
     error: "",
     switching: "" as string, // task_type currently being switched, for per-row disabling
+    load: null as SystemLoad | null,
+    loadError: "",
+    loadPollHandle: null as ReturnType<typeof setInterval> | null,
   }),
   actions: {
     async fetchRegistry() {
@@ -44,6 +70,25 @@ export const useModelsStore = defineStore("models", {
         this.error = e instanceof Error ? e.message : String(e);
       } finally {
         this.switching = "";
+      }
+    },
+    async fetchLoad() {
+      try {
+        this.load = await apiGet<SystemLoad>("/system/load");
+        this.loadError = "";
+      } catch (e) {
+        this.loadError = e instanceof Error ? e.message : String(e);
+      }
+    },
+    startLoadPolling() {
+      if (this.loadPollHandle !== null) return;
+      this.fetchLoad();
+      this.loadPollHandle = setInterval(() => this.fetchLoad(), 5000);
+    },
+    stopLoadPolling() {
+      if (this.loadPollHandle !== null) {
+        clearInterval(this.loadPollHandle);
+        this.loadPollHandle = null;
       }
     },
   },
