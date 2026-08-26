@@ -1,5 +1,7 @@
-<script setup lang="ts"></script>
+<script setup lang="ts">
+import AppShell from "./components/layout/AppShell.vue";
+</script>
 
 <template>
-  <h1>Hi</h1>
+  <AppShell />
 </template>

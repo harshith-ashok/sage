@@ -1,0 +1,62 @@
+ollama_endpoint: http://localhost:11434
+task_types:
+  reasoning:
+    active: gpt-oss-120b-cloud
+    candidates:
+      gpt-oss-120b-cloud:
+        model_id: gpt-oss:120b-cloud
+        location: cloud
+        context_window: 128000
+      qwen3-8b:
+        model_id: qwen3:8b
+        location: local
+        context_window: 40000
+  coding:
+    active: deepseek-v4-flash-cloud
+    candidates:
+      deepseek-v4-flash-cloud:
+        model_id: deepseek-v4-flash:cloud
+        location: cloud
+        context_window: 128000
+      qwen2.5-coder-7b:
+        model_id: qwen2.5-coder:7b
+        location: local
+        context_window: 32000
+  vision:
+    active: gemma4-31b-cloud
+    candidates:
+      gemma4-31b-cloud:
+        model_id: gemma4:31b-cloud
+        location: cloud
+        context_window: 128000
+      qwen2.5vl-7b:
+        model_id: qwen2.5vl:7b
+        location: local
+        context_window: 32000
+  embedding:
+    active: bge-m3
+    candidates:
+      bge-m3:
+        model_id: bge-m3:latest
+        location: local
+        context_window: 8192
+      nomic-embed-text:
+        model_id: nomic-embed-text:latest
+        location: local
+        context_window: 8192
+  translation_en_indic:
+    active: indictrans2-en-indic-dist-200M
+    candidates:
+      indictrans2-en-indic-dist-200M:
+        model_id: ai4bharat/indictrans2-en-indic-dist-200M
+        location: local
+        context_window: 256
+        engine: transformers
+  translation_indic_en:
+    active: indictrans2-indic-en-dist-200M
+    candidates:
+      indictrans2-indic-en-dist-200M:
+        model_id: ai4bharat/indictrans2-indic-en-dist-200M
+        location: local
+        context_window: 256
+        engine: transformers
