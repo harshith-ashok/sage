@@ -286,3 +286,69 @@ h3 {
 .sage-trace-enter-active {
   animation: sage-fade-up 220ms ease-out;
 }
+
+/* Rotating "still working" status phrase (ConsoleView.vue) crossfading
+   between words on each rotation, instead of the text just snapping. */
+.phrase-fade-enter-active,
+.phrase-fade-leave-active {
+  transition: opacity 180ms ease;
+}
+.phrase-fade-enter-from,
+.phrase-fade-leave-to {
+  opacity: 0;
+}
+
+/* Ctrl+P / the Console's "Export PDF" button (window.print()) — both just
+   trigger the browser's native print dialog, so this block IS the export:
+   it's what turns "print the raw app UI" into "print a clean conversation
+   transcript." Two problems solved here, not just hiding a sidebar:
+   (1) app chrome (nav, header controls, input bar) has no place in a
+   printed document, and (2) the transcript lives in a fixed-height
+   `overflow-y-auto` region — printed as-is, only whatever's currently
+   scrolled into view would render, silently truncating the conversation.
+   Un-clipping height/overflow on every ancestor down to the transcript is
+   what makes the *entire* chat print, not just one screen's worth. */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  aside {
+    display: none !important;
+  }
+  html,
+  body,
+  #app {
+    height: auto !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+  }
+  main,
+  .sage-transcript {
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+    flex: none !important;
+  }
+  /* Force light, ink-economical colors regardless of the active theme —
+     printing a dark UI theme wastes ink and reads poorly on paper. */
+  :root {
+    --color-bg: #ffffff;
+    --color-panel: #ffffff;
+    --color-panel-2: #f4f5f7;
+    --color-border: #d7dae0;
+    --color-border-soft: #e7e9ed;
+    --color-text: #111318;
+    --color-dim: #4b5563;
+    --color-dim-2: #6b7280;
+  }
+  .sage-turn {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  /* Trace chrome (tool calls, tier pills, thinking blocks) is useful while
+     working, not in an exported transcript meant to be read as a document. */
+  .sage-turn details,
+  .sage-caret {
+    display: none !important;
+  }
+}

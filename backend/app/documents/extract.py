@@ -10,6 +10,7 @@ openpyxl/python-pptx libraries, just the other direction.
 
 import os
 
+import pymupdf
 import pymupdf4llm
 from docx import Document as DocxDocument
 from openpyxl import load_workbook
@@ -77,3 +78,29 @@ def extract_text(file_path: str, filename: str) -> str:
     raise UnsupportedDocumentType(
         f"Unsupported document type '{ext}'. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
     )
+
+
+MAX_RENDERED_PAGES = 5
+
+
+def render_pdf_pages(file_path: str, max_pages: int = MAX_RENDERED_PAGES, dpi: int = 150) -> list[bytes]:
+    """Renders each of a PDF's first `max_pages` pages to a real PNG image
+    — `pymupdf4llm.to_markdown()` (extract_text, above) only ever pulls
+    *text*, silently dropping any figure/diagram/photo embedded in the
+    page; a text-only extraction of a PDF containing a P&ID excerpt or a
+    photo would report nothing at all about it. This lets a page also be
+    handed to the vision model (app.agent's read_document_page_as_image)
+    the same way an uploaded image already is, so a PDF's figures aren't
+    invisible to the agent just because they arrived inside a PDF rather
+    than as a standalone image."""
+    doc = pymupdf.open(file_path)
+    try:
+        images = []
+        zoom = dpi / 72  # PDF's native unit is 72 DPI
+        matrix = pymupdf.Matrix(zoom, zoom)
+        for page in doc[:max_pages]:
+            pix = page.get_pixmap(matrix=matrix)
+            images.append(pix.tobytes("png"))
+        return images
+    finally:
+        doc.close()

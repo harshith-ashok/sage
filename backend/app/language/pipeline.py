@@ -41,6 +41,7 @@ def run_agent_multilingual(
     thread_id: str | None = None,
     output_language: str | None = None,
     use_knowledge_base: bool = True,
+    document_page_images: list[str] | None = None,
 ) -> None:
     try:
         detected = detect_language(prompt)
@@ -70,7 +71,7 @@ def run_agent_multilingual(
         emit("translated_prompt", {"original": prompt, "english": english_prompt})
 
     if not target_language:
-        run_agent(english_prompt, image_b64, emit, audio_path, document_text, thread_id, use_knowledge_base)
+        run_agent(english_prompt, image_b64, emit, audio_path, document_text, thread_id, use_knowledge_base, document_page_images)
         return
 
     final_content = ""
@@ -84,7 +85,7 @@ def run_agent_multilingual(
             return
         emit(event, data)
 
-    run_agent(english_prompt, image_b64, capture, audio_path, document_text, thread_id, use_knowledge_base)
+    run_agent(english_prompt, image_b64, capture, audio_path, document_text, thread_id, use_knowledge_base, document_page_images)
 
     if final_content:
         try:

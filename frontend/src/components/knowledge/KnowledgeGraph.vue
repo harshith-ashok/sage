@@ -1,5 +1,8 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { DataSet } from "vis-data";
+import { Network } from "vis-network";
+import "vis-network/styles/vis-network.css";
 
 interface ChunkNode {
   chunk_id: string;
@@ -29,49 +32,106 @@ export type Selection =
 
 const props = defineProps<{
   data: GraphData;
-  // Sources/sections a live search matched — "source" alone highlights the
-  // whole document node, "source::section" highlights that section node
-  // specifically. A plain SVG line is drawn from the query pseudo-node to
-  // every highlighted section so it's visually obvious *where* an answer's
-  // grounding actually came from in the corpus, not just that it matched.
+  // "source" alone highlights the whole document node, "source::section"
+  // highlights that specific section — see updateHighlights() below.
   highlightedSections?: Set<string>;
   queryLabel?: string | null;
 }>();
 const emit = defineEmits<{ select: [Selection] }>();
 
-const SIZE = 640;
-const CENTER = SIZE / 2;
-const DOC_RADIUS = 150;
-const SECTION_RADIUS = 235;
-const QUERY_Y = 26;
+const container = ref<HTMLDivElement | null>(null);
+let network: Network | null = null;
+let nodes: DataSet<any> | null = null;
+let edges: DataSet<any> | null = null;
 
-const layout = computed(() => {
-  const docs = props.data.documents;
-  const n = Math.max(docs.length, 1);
-  return docs.map((doc, i) => {
-    const angle = (i / n) * Math.PI * 2 - Math.PI / 2;
-    const x = CENTER + DOC_RADIUS * Math.cos(angle);
-    const y = CENTER + DOC_RADIUS * Math.sin(angle);
-    const r = Math.min(10 + doc.chunk_count * 1.8, 26);
+// Theme tokens are CSS custom properties (see style.css) — read them at
+// build time so node/edge colors follow whichever theme is active instead
+// of hardcoding light- or dark-mode-only colors.
+function cssVar(name: string): string {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || "#888";
+}
 
-    const sectionCount = Math.max(doc.sections.length, 1);
-    // Sections fan out in a small arc centered on the document's own
-    // angle, rather than a full circle — keeps each document's sections
-    // visually grouped near their parent instead of scattered.
-    const arc = Math.min(0.16 * sectionCount, Math.PI * 1.8) / n;
-    const sections = doc.sections.map((section, j) => {
-      const sAngle = angle - arc / 2 + (sectionCount === 1 ? arc / 2 : (arc * j) / (sectionCount - 1));
-      return {
-        section,
-        x: CENTER + SECTION_RADIUS * Math.cos(sAngle),
-        y: CENTER + SECTION_RADIUS * Math.sin(sAngle),
-        r: Math.min(5 + section.chunk_count * 1.3, 11),
-      };
+const CATEGORY_ROOT = "__root__";
+
+function buildGraph() {
+  if (!container.value) return;
+
+  const nodeItems: any[] = [
+    { id: CATEGORY_ROOT, label: "Knowledge Base", shape: "dot", size: 26, color: cssVar("--color-panel-2"), font: { color: cssVar("--color-text"), size: 13 }, fixed: false },
+  ];
+  const edgeItems: any[] = [];
+
+  for (const doc of props.data.documents) {
+    const docId = `doc::${doc.source}`;
+    nodeItems.push({
+      id: docId,
+      label: doc.title.length > 28 ? doc.title.slice(0, 27) + "…" : doc.title,
+      shape: "dot",
+      size: Math.min(14 + doc.chunk_count * 1.6, 30),
+      color: { background: cssVar("--color-panel"), border: cssVar("--color-border"), highlight: { background: cssVar("--color-accent"), border: cssVar("--color-accent") } },
+      font: { color: cssVar("--color-dim"), size: 11 },
+      borderWidth: 2,
     });
+    edgeItems.push({ id: `e::${docId}`, from: CATEGORY_ROOT, to: docId, color: cssVar("--color-border") });
 
-    return { doc, x, y, r, angle, sections };
+    for (const section of doc.sections) {
+      const secId = `sec::${doc.source}::${section.section}`;
+      nodeItems.push({
+        id: secId,
+        label: `§${section.section}`,
+        shape: "dot",
+        size: Math.min(6 + section.chunk_count * 1.4, 14),
+        color: { background: cssVar("--color-panel-2"), border: cssVar("--color-border") },
+        font: { color: cssVar("--color-dim-2"), size: 9 },
+        borderWidth: 1.5,
+      });
+      edgeItems.push({ id: `e::${secId}`, from: docId, to: secId, color: cssVar("--color-border-soft"), length: 60 });
+    }
+  }
+
+  nodes = new DataSet(nodeItems);
+  edges = new DataSet(edgeItems);
+
+  network = new Network(
+    container.value,
+    { nodes, edges },
+    {
+      physics: {
+        enabled: true,
+        solver: "barnesHut",
+        barnesHut: { gravitationalConstant: -3000, springLength: 90, springConstant: 0.04, damping: 0.4, avoidOverlap: 0.4 },
+        stabilization: { iterations: 200 },
+      },
+      interaction: { hover: true, tooltipDelay: 150, dragNodes: true, zoomView: true },
+      nodes: { shadow: false },
+      edges: { smooth: { enabled: true, type: "continuous", roundness: 0.5 } },
+    },
+  );
+
+  network.on("click", (params) => {
+    if (params.nodes.length === 0) return;
+    const id = params.nodes[0] as string;
+    emitSelectionFor(id);
   });
-});
+
+  updateHighlights();
+}
+
+function emitSelectionFor(id: string) {
+  if (id.startsWith("doc::")) {
+    const source = id.slice("doc::".length);
+    const doc = props.data.documents.find((d) => d.source === source);
+    if (doc) emit("select", { kind: "document", document: doc });
+  } else if (id.startsWith("sec::")) {
+    const rest = id.slice("sec::".length);
+    const lastSep = rest.lastIndexOf("::");
+    const source = rest.slice(0, lastSep);
+    const sectionKey = rest.slice(lastSep + 2);
+    const doc = props.data.documents.find((d) => d.source === source);
+    const section = doc?.sections.find((s) => s.section === sectionKey);
+    if (doc && section) emit("select", { kind: "section", document: doc, section });
+  }
+}
 
 function isHighlighted(source: string, section?: string): boolean {
   if (!props.highlightedSections) return false;
@@ -86,78 +146,82 @@ function docIsHighlighted(source: string): boolean {
   }
   return false;
 }
+
+const QUERY_NODE_ID = "__query__";
+
+function updateHighlights() {
+  if (!nodes || !edges) return;
+  const accent = cssVar("--color-accent");
+  const accentInk = cssVar("--color-accent-ink");
+  const updates: any[] = [];
+  const highlightedSecIds: string[] = [];
+  for (const doc of props.data.documents) {
+    const docId = `doc::${doc.source}`;
+    const docHi = docIsHighlighted(doc.source);
+    updates.push({
+      id: docId,
+      color: docHi
+        ? { background: accent, border: accent }
+        : { background: cssVar("--color-panel"), border: cssVar("--color-border") },
+      font: { color: docHi ? accentInk : cssVar("--color-dim"), size: 11 },
+    });
+    for (const section of doc.sections) {
+      const secId = `sec::${doc.source}::${section.section}`;
+      const secHi = isHighlighted(doc.source, section.section);
+      if (secHi) highlightedSecIds.push(secId);
+      updates.push({
+        id: secId,
+        color: secHi
+          ? { background: accent, border: accent }
+          : { background: cssVar("--color-panel-2"), border: cssVar("--color-border") },
+        font: { color: secHi ? accentInk : cssVar("--color-dim-2"), size: 9 },
+      });
+    }
+  }
+  nodes.update(updates);
+
+  // A transient "query" node connected to whatever a live search actually
+  // matched — added/removed dynamically rather than always present, so the
+  // graph's default (no search yet) state stays a clean corpus overview.
+  const queryEdgeIds = edges.getIds({ filter: (e: any) => typeof e.id === "string" && e.id.startsWith("qe::") });
+  edges.remove(queryEdgeIds);
+  nodes.remove(nodes.getIds({ filter: (n: any) => n.id === QUERY_NODE_ID }));
+
+  if (props.queryLabel && highlightedSecIds.length > 0) {
+    nodes.add({
+      id: QUERY_NODE_ID,
+      label: "query",
+      shape: "diamond",
+      size: 16,
+      color: { background: accent, border: accent },
+      font: { color: cssVar("--color-text"), size: 10 },
+    });
+    edges.add(
+      highlightedSecIds.map((secId) => ({
+        id: `qe::${secId}`,
+        from: QUERY_NODE_ID,
+        to: secId,
+        dashes: true,
+        color: accent,
+        width: 1.5,
+      })),
+    );
+  }
+}
+
+watch(() => props.highlightedSections, updateHighlights, { deep: true });
+watch(
+  () => props.data,
+  () => {
+    network?.destroy();
+    buildGraph();
+  },
+);
+
+onMounted(buildGraph);
+onBeforeUnmount(() => network?.destroy());
 </script>
 
 <template>
-  <svg :viewBox="`0 0 ${SIZE} ${SIZE}`" class="h-full w-full select-none" role="img" aria-label="Knowledge base corpus graph">
-    <!-- center -> document edges -->
-    <g stroke="var(--color-border)" stroke-width="1">
-      <line v-for="l in layout" :key="`e-${l.doc.source}`" :x1="CENTER" :y1="CENTER" :x2="l.x" :y2="l.y" />
-    </g>
-    <!-- document -> section edges -->
-    <g stroke="var(--color-border-soft)" stroke-width="1">
-      <template v-for="l in layout" :key="`se-${l.doc.source}`">
-        <line v-for="s in l.sections" :key="`se-${l.doc.source}-${s.section.section}`" :x1="l.x" :y1="l.y" :x2="s.x" :y2="s.y" />
-      </template>
-    </g>
-
-    <!-- query pseudo-node + highlight edges, only while a search's results are showing -->
-    <template v-if="queryLabel && highlightedSections && highlightedSections.size > 0">
-      <g stroke="var(--color-accent)" stroke-width="1.4" stroke-dasharray="3 3" opacity="0.7">
-        <template v-for="l in layout" :key="`h-${l.doc.source}`">
-          <template v-for="s in l.sections" :key="`h-${l.doc.source}-${s.section.section}`">
-            <line v-if="isHighlighted(l.doc.source, s.section.section)" :x1="CENTER" :y1="QUERY_Y" :x2="s.x" :y2="s.y" />
-          </template>
-        </template>
-      </g>
-      <circle :cx="CENTER" :cy="QUERY_Y" r="7" fill="var(--color-accent)" />
-      <text :x="CENTER" :y="QUERY_Y - 12" text-anchor="middle" font-size="10.5" fill="var(--color-accent)" font-family="var(--font-mono)">
-        query
-      </text>
-    </template>
-
-    <!-- center node -->
-    <circle :cx="CENTER" :cy="CENTER" r="20" fill="var(--color-panel-2)" stroke="var(--color-border)" stroke-width="1.5" />
-    <text :x="CENTER" :y="CENTER + 4" text-anchor="middle" font-size="9" font-family="var(--font-mono)" fill="var(--color-dim)">KB</text>
-
-    <!-- document + section nodes -->
-    <g v-for="l in layout" :key="l.doc.source">
-      <g v-for="s in l.sections" :key="s.section.section" class="cursor-pointer" @click="emit('select', { kind: 'section', document: l.doc, section: s.section })">
-        <circle
-          :cx="s.x"
-          :cy="s.y"
-          :r="s.r"
-          :fill="isHighlighted(l.doc.source, s.section.section) ? 'var(--color-accent)' : 'var(--color-panel-2)'"
-          :stroke="isHighlighted(l.doc.source, s.section.section) ? 'var(--color-accent)' : 'var(--color-border)'"
-          stroke-width="1.3"
-        >
-          <title>{{ l.doc.title }} · Section {{ s.section.section }} ({{ s.section.chunk_count }} chunk{{ s.section.chunk_count === 1 ? "" : "s" }})</title>
-        </circle>
-      </g>
-
-      <circle
-        :cx="l.x"
-        :cy="l.y"
-        :r="l.r"
-        :fill="docIsHighlighted(l.doc.source) ? 'var(--color-accent)' : 'var(--color-panel)'"
-        :stroke="docIsHighlighted(l.doc.source) ? 'var(--color-accent)' : 'var(--color-border)'"
-        stroke-width="1.6"
-        class="cursor-pointer transition-colors"
-        @click="emit('select', { kind: 'document', document: l.doc })"
-      >
-        <title>{{ l.doc.title }} ({{ l.doc.chunk_count }} chunks)</title>
-      </circle>
-      <text
-        :x="l.x"
-        :y="l.y + l.r + 13"
-        text-anchor="middle"
-        font-size="9.5"
-        font-family="var(--font-sans)"
-        :fill="docIsHighlighted(l.doc.source) ? 'var(--color-accent)' : 'var(--color-dim)'"
-        class="pointer-events-none"
-      >
-        {{ l.doc.title.length > 22 ? l.doc.title.slice(0, 21) + "…" : l.doc.title }}
-      </text>
-    </g>
-  </svg>
+  <div ref="container" class="h-full w-full" />
 </template>

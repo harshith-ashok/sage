@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app import config as model_config
-from app.documents.extract import UnsupportedDocumentType, extract_text
+from app.documents.extract import UnsupportedDocumentType, extract_text, render_pdf_pages
 from app.knowledge.graph import build_corpus_graph
 from app.knowledge.query import run_query
 from app.language.pipeline import run_agent_multilingual
@@ -183,12 +183,23 @@ async def create_agent_chat(
             f.write(await audio.read())
 
     document_text = None
+    document_page_images = None
     if document is not None:
         fd, doc_path = tempfile.mkstemp(suffix=os.path.splitext(document.filename or "")[1])
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(await document.read())
             document_text = extract_text(doc_path, document.filename or "")
+            # pymupdf4llm's own OCR pass (extract_text, above) picks up any
+            # text *inside* a PDF's embedded figures, but has no shape/symbol
+            # understanding at all — a P&ID's bowtie-valve symbols become
+            # unrecognizable character soup, just tags like "PT-2203" read
+            # correctly. Rendering each page as a real image lets the vision
+            # model (read_document_page_as_image, app/agent.py) actually see
+            # and classify what a figure shows, not just OCR its text.
+            if os.path.splitext(document.filename or "")[1].lower() == ".pdf":
+                page_images = render_pdf_pages(doc_path)
+                document_page_images = [base64.b64encode(img).decode() for img in page_images]
         except UnsupportedDocumentType as e:
             raise HTTPException(status_code=400, detail=str(e))
         finally:
@@ -196,7 +207,9 @@ async def create_agent_chat(
 
     def work(emit):
         try:
-            run_agent_multilingual(prompt, image_b64, emit, audio_path, document_text, conversation_id, output_language, use_knowledge_base)
+            run_agent_multilingual(
+                prompt, image_b64, emit, audio_path, document_text, conversation_id, output_language, use_knowledge_base, document_page_images
+            )
         finally:
             if audio_path:
                 os.remove(audio_path)
@@ -311,6 +324,10 @@ _DELIVERABLE_MEDIA_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    # Phase 9 follow-up: annotate_pid_drawing (app/tasks/pid_annotate.py)
+    # saves a real annotated image, not an Office file — same deliverable
+    # list/download path, just a different media type.
+    ".png": "image/png",
 }
 
 

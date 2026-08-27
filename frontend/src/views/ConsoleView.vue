@@ -84,11 +84,151 @@ const recording = ref(false);
 const transcribing = ref(false);
 const transcribeError = ref<string | null>(null);
 const running = ref(false);
+
+// Rotating status phrases for the trailing "still working" indicator — the
+// specific real backend signals (tier_selected, tool_call, thinking) already
+// render their own trace lines above this one, so this is deliberately a
+// generic, varied filler for the gap *between* those (or before the first
+// one arrives), rather than a duplicate of information shown elsewhere.
+const WORKING_PHRASES = [
+  "Thinking",
+  "Reading the request",
+  "Working through the details",
+  "Structuring a response",
+  "Reasoning through the steps",
+  "Going through the knowledge base",
+  "Cross-referencing sources",
+  "Checking the details",
+  "Putting it together",
+  "Drafting a response",
+  "Weighing the options",
+  "Reviewing the findings",
+  "Tying it together",
+  "Almost there",
+];
+const workingPhrase = ref(WORKING_PHRASES[0]);
+let workingPhraseTimer: ReturnType<typeof setInterval> | null = null;
+let workingPhraseIndex = 0;
+
+function startWorkingPhraseRotation() {
+  workingPhraseIndex = 0;
+  workingPhrase.value = WORKING_PHRASES[0];
+  clearWorkingPhraseTimer();
+  workingPhraseTimer = setInterval(() => {
+    workingPhraseIndex = (workingPhraseIndex + 1) % WORKING_PHRASES.length;
+    workingPhrase.value = WORKING_PHRASES[workingPhraseIndex];
+  }, 2200);
+}
+
+function clearWorkingPhraseTimer() {
+  if (workingPhraseTimer !== null) {
+    clearInterval(workingPhraseTimer);
+    workingPhraseTimer = null;
+  }
+}
 const transcriptEl = ref<HTMLDivElement | null>(null);
 const textareaEl = ref<HTMLTextAreaElement | null>(null);
 const codeModal = ref<{ code: string; language: string } | null>(null);
 
 let activeSource: EventSource | null = null;
+
+// Typewriter reveal: real tokens already arrive incrementally over SSE, but
+// raw network/generation timing is bursty (a chunk can carry one token or a
+// dozen), so appending it straight to seg.content looked jumpy rather than
+// like a steady typing animation. This decouples "how fast text visually
+// appears" from "how the network happened to deliver it": incoming text is
+// queued in a per-segment buffer and drained a little at a time on every
+// animation frame, so it always reads as a smooth, consistent typing pace
+// regardless of chunk size. The reveal rate scales with backlog size (a
+// fixed percentage per frame, floored at a small minimum) rather than a
+// flat chars/tick number — a fixed rate would either crawl on a short
+// reply or fall further and further behind on a long one; a percentage
+// converges geometrically either way, so a big burst (e.g. the tail end of
+// a response) catches up quickly instead of trailing the actual answer by
+// seconds.
+const TYPE_MIN_CHARS_PER_TICK = 2;
+const TYPE_CATCH_UP_RATIO = 0.15;
+type StreamableSegment = Segment & { kind: "text" | "thinking"; content: string };
+const pendingReveal = new Map<StreamableSegment, string>();
+const finalizingSegments = new Set<StreamableSegment>();
+let typewriterFrame: number | null = null;
+
+function queueReveal(seg: StreamableSegment, text: string) {
+  if (!text) return;
+  pendingReveal.set(seg, (pendingReveal.get(seg) ?? "") + text);
+  startTypewriter();
+}
+
+/** Called once no more `token`/`thinking` deltas are coming for this
+ * segment — `fullText`, when given, is the authoritative complete text
+ * (from the `message`/`translated_response` event); any tail not yet
+ * revealed or queued is appended so the animation still plays through to
+ * the real end instead of silently truncating. The segment only leaves
+ * "streaming" render mode (raw text -> full Markdown) once its buffer
+ * actually drains, not the instant this is called — otherwise the
+ * animation would jump-cut to the final render mid-reveal. */
+function queueFinalize(seg: StreamableSegment, fullText?: string) {
+  if (fullText !== undefined) {
+    const alreadyAccountedFor = seg.content.length + (pendingReveal.get(seg)?.length ?? 0);
+    if (fullText.length > alreadyAccountedFor) queueReveal(seg, fullText.slice(alreadyAccountedFor));
+    else if (fullText.length < seg.content.length) seg.content = fullText; // shouldn't happen, but never show stale-longer text
+  }
+  if (pendingReveal.get(seg)) {
+    finalizingSegments.add(seg);
+  } else if (seg.kind === "text") {
+    seg.streaming = false;
+  }
+}
+
+/** For the one case where a segment's full text is being *replaced*, not
+ * grown (translated_response swapping translated text in for the English
+ * draft) — queueFinalize's diff assumes fullText is a continuation of
+ * what's already shown, which doesn't hold when the replacement text has
+ * no relation to the old content's length. Clears and re-streams instead. */
+function resetAndReveal(seg: StreamableSegment, fullText: string) {
+  pendingReveal.delete(seg);
+  finalizingSegments.delete(seg);
+  seg.content = "";
+  if (seg.kind === "text") seg.streaming = true;
+  queueFinalize(seg, fullText);
+}
+
+function startTypewriter() {
+  if (typewriterFrame !== null) return;
+  const tick = () => {
+    let stillPending = false;
+    for (const [seg, buffer] of pendingReveal) {
+      if (!buffer) {
+        pendingReveal.delete(seg);
+        if (finalizingSegments.has(seg)) {
+          finalizingSegments.delete(seg);
+          if (seg.kind === "text") seg.streaming = false;
+        }
+        continue;
+      }
+      const revealCount = Math.min(buffer.length, Math.max(TYPE_MIN_CHARS_PER_TICK, Math.ceil(buffer.length * TYPE_CATCH_UP_RATIO)));
+      seg.content += buffer.slice(0, revealCount);
+      const rest = buffer.slice(revealCount);
+      if (rest) {
+        pendingReveal.set(seg, rest);
+        stillPending = true;
+      } else {
+        pendingReveal.delete(seg);
+        if (finalizingSegments.has(seg)) {
+          finalizingSegments.delete(seg);
+          if (seg.kind === "text") seg.streaming = false;
+        }
+      }
+    }
+    if (stillPending) {
+      scrollToBottom();
+      typewriterFrame = requestAnimationFrame(tick);
+    } else {
+      typewriterFrame = null;
+    }
+  };
+  typewriterFrame = requestAnimationFrame(tick);
+}
 let mediaRecorder: MediaRecorder | null = null;
 let recordedChunks: Blob[] = [];
 
@@ -147,10 +287,21 @@ function loadTurns() {
 function newChat() {
   activeSource?.close();
   running.value = false;
+  clearWorkingPhraseTimer();
   turns.value = [];
   conversationId.value = crypto.randomUUID();
   localStorage.removeItem(STORAGE_KEY);
   localStorage.setItem(CONVERSATION_ID_KEY, conversationId.value);
+}
+
+/** Ctrl+P (or this button) opens the browser's native print dialog — the
+ * "export" itself is `style.css`'s `@media print` block, which hides the
+ * sidebar/input bar/controls and un-clips the transcript's scroll region so
+ * the *entire* conversation renders, not just whatever's currently visible
+ * on screen. This function only exists for the explicit button; Ctrl+P
+ * already triggers the same browser dialog on its own and needs no JS. */
+function printTranscript() {
+  window.print();
 }
 
 /** A turn's own natural language — English unless its input triggered
@@ -301,8 +452,12 @@ async function toggleRecording() {
 }
 
 function deliverableLink(content: string): { filename: string } | null {
-  const match = /Saved as ([\w.-]+\.(?:docx|xlsx|pptx))/.exec(content);
+  const match = /Saved as ([\w.-]+\.(?:docx|xlsx|pptx|png))/.exec(content);
   return match ? { filename: match[1] } : null;
+}
+
+function isImageDeliverable(filename: string): boolean {
+  return /\.(png|jpe?g)$/i.test(filename);
 }
 
 // check_cross_document_contradictions (app/agent.py) instructs the model to
@@ -373,6 +528,7 @@ async function submit() {
   };
   turns.value.push(turn);
   running.value = true;
+  startWorkingPhraseRotation();
   scrollToBottom("smooth");
 
   const form = new FormData();
@@ -397,18 +553,15 @@ async function submit() {
       {
         thinking: (d) => {
           const seg = findThinkingSegment(turn, d.id);
-          seg.content += d.content;
-          scrollToBottom();
+          queueReveal(seg, d.content);
         },
         token: (d) => {
           const seg = findTextSegment(turn, d.id);
-          seg.content += d.content;
-          scrollToBottom();
+          queueReveal(seg, d.content);
         },
         message: (d) => {
           const seg = findTextSegment(turn, d.id);
-          seg.content = d.content;
-          seg.streaming = false;
+          queueFinalize(seg, d.content);
           // This is the English draft finishing — translate_from_english()
           // runs synchronously after this with no event of its own, so
           // without a placeholder the UI would sit on the (wrong-language)
@@ -461,8 +614,7 @@ async function submit() {
           const target = textSegs[textSegs.length - 1];
           if (target) {
             target.originalEnglish = d.english;
-            target.content = d.translated;
-            target.streaming = false;
+            resetAndReveal(target, d.translated);
           } else {
             turn.segments.push({ kind: "text", id: "translated", content: d.translated, streaming: false, originalEnglish: d.english });
           }
@@ -480,9 +632,11 @@ async function submit() {
         },
         done: (d) => {
           // Any segment still marked "streaming" (no matching `message` arrived,
-          // e.g. the very last chunk) gets a final, clean render too.
+          // e.g. the very last chunk) gets a final, clean render too — via
+          // queueFinalize so a still-animating reveal plays out to its real
+          // end instead of jump-cutting to the full-Markdown render.
           for (const seg of turn.segments) {
-            if (seg.kind === "text") seg.streaming = false;
+            if (seg.kind === "text" && seg.streaming) queueFinalize(seg);
           }
           // If translation failed, pipeline.py falls back to emitting the
           // English content directly here without ever sending
@@ -494,6 +648,7 @@ async function submit() {
           }
           turn.status = "done";
           running.value = false;
+  clearWorkingPhraseTimer();
           scrollToBottom("smooth");
           persistTurns();
         },
@@ -501,6 +656,7 @@ async function submit() {
           turn.status = "error";
           turn.errorMessage = d?.error ?? "The agent failed.";
           running.value = false;
+  clearWorkingPhraseTimer();
           persistTurns();
         },
       },
@@ -509,6 +665,7 @@ async function submit() {
           turn.status = "error";
           turn.errorMessage = `Couldn't reach the agent stream at ${API_BASE}${streamPath}`;
           running.value = false;
+  clearWorkingPhraseTimer();
           persistTurns();
         },
         terminalEvents: ["done", "error"],
@@ -518,6 +675,7 @@ async function submit() {
     turn.status = "error";
     turn.errorMessage = e instanceof Error ? e.message : String(e);
     running.value = false;
+  clearWorkingPhraseTimer();
     persistTurns();
   }
 }
@@ -533,6 +691,8 @@ onUnmounted(() => {
   activeSource?.close();
   mediaRecorder?.stop();
   if (scrollFrame !== null) cancelAnimationFrame(scrollFrame);
+  if (typewriterFrame !== null) cancelAnimationFrame(typewriterFrame);
+  clearWorkingPhraseTimer();
 });
 </script>
 
@@ -547,7 +707,7 @@ onUnmounted(() => {
           decides what to do.
         </p>
       </div>
-      <div class="flex shrink-0 flex-col items-end gap-1.5">
+      <div class="no-print flex shrink-0 flex-col items-end gap-1.5">
         <NetworkStatusBadge />
         <div class="flex items-center gap-2">
           <span class="text-[11px] text-dim" title="Every answer already on screen re-translates the instant you click one">Answer in</span>
@@ -568,13 +728,14 @@ onUnmounted(() => {
             </button>
           </div>
           <span v-if="retranslating" class="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" title="Translating everything on screen…" />
+          <Button v-if="turns.length > 0" variant="ghost" title="Export this conversation as a PDF (opens the print dialog — choose 'Save as PDF')" @click="printTranscript">Export PDF</Button>
           <Button v-if="turns.length > 0" variant="ghost" @click="newChat">New chat</Button>
         </div>
         <p v-if="retranslateError" class="text-[11px] text-danger">{{ retranslateError }}</p>
       </div>
     </div>
 
-    <div ref="transcriptEl" class="flex-1 overflow-y-auto px-8 py-6">
+    <div ref="transcriptEl" class="sage-transcript flex-1 overflow-y-auto px-8 py-6">
       <div class="mx-auto flex max-w-3xl flex-col gap-6">
         <p v-if="turns.length === 0" class="text-[12.5px] text-dim-2">
           Try: "How often shall critical service valves be visually inspected?", "What is 5000 N over 0.02 m² in
@@ -582,7 +743,7 @@ onUnmounted(() => {
           approval note, attach a document and ask about it, or record a voice question.
         </p>
 
-        <div v-for="(turn, i) in turns" :key="i" class="flex flex-col gap-3">
+        <div v-for="(turn, i) in turns" :key="i" class="sage-turn flex flex-col gap-3">
           <!-- user message -->
           <div class="self-end max-w-[85%] rounded-lg bg-accent/10 border border-accent/30 px-3.5 py-2.5">
             <img v-if="turn.imagePreviewUrl" :src="turn.imagePreviewUrl" class="mb-2 max-h-40 rounded-md border border-border-soft" />
@@ -636,13 +797,19 @@ onUnmounted(() => {
 
               <div v-else-if="seg.kind === 'tool_result'" class="ml-3.5 rounded-md border border-border-soft bg-panel-2 px-3 py-2">
                 <Markdown :content="seg.content" @view-code="onViewCode" />
-                <a
-                  v-if="deliverableLink(seg.content)"
-                  :href="`${API_BASE}/deliverables/${deliverableLink(seg.content)!.filename}`"
-                  class="mt-1 inline-block text-[11.5px] font-medium text-accent hover:underline"
-                >
-                  Download {{ deliverableLink(seg.content)!.filename }}
-                </a>
+                <template v-if="deliverableLink(seg.content)">
+                  <img
+                    v-if="isImageDeliverable(deliverableLink(seg.content)!.filename)"
+                    :src="`${API_BASE}/deliverables/${deliverableLink(seg.content)!.filename}`"
+                    class="mt-2 max-w-full rounded-md border border-border-soft"
+                  />
+                  <a
+                    :href="`${API_BASE}/deliverables/${deliverableLink(seg.content)!.filename}`"
+                    class="mt-1 inline-block text-[11.5px] font-medium text-accent hover:underline"
+                  >
+                    Download {{ deliverableLink(seg.content)!.filename }}
+                  </a>
+                </template>
               </div>
 
               <div v-else-if="seg.kind === 'text' && seg.content" class="text-[13px] leading-relaxed text-text">
@@ -691,9 +858,11 @@ onUnmounted(() => {
             </div>
           </TransitionGroup>
 
-          <div v-if="turn.status === 'running'" class="flex items-center gap-2 text-[12px] text-dim-2">
+          <div v-if="turn.status === 'running' && turn === turns[turns.length - 1]" class="flex items-center gap-2 text-[12px] text-dim-2">
             <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-dim-2" />
-            working…
+            <Transition name="phrase-fade" mode="out-in">
+              <span :key="workingPhrase">{{ workingPhrase }}…</span>
+            </Transition>
           </div>
           <p v-if="turn.status === 'error'" class="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[12.5px] text-danger">
             {{ turn.errorMessage }}
@@ -702,7 +871,7 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div class="border-t border-border px-8 py-4">
+    <div class="no-print border-t border-border px-8 py-4">
       <div class="mx-auto flex max-w-3xl flex-col gap-2">
         <div v-if="attachedPreviewUrl || attachedDocument || transcribing || transcribeError" class="flex flex-wrap items-center gap-2">
           <div v-if="attachedPreviewUrl" class="flex items-center gap-2">
