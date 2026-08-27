@@ -11,6 +11,8 @@ run code, and do exact math — instead of guessing.
 
 ---
 
+## ![demo screenshot](demo.png)
+
 ## What it can do today
 
 - 💬 **One chat box for everything** — no menus, no task-type dropdown. Type what
@@ -63,7 +65,7 @@ run code, and do exact math — instead of guessing.
   doesn't actually match what the spec requires.
 - 🔀 **Cross-check a new finding against everything already on record** —
   mention a measurement, setpoint, or compliance status for a specific piece
-  of equipment, and SAGE searches related SOPs *and* engineering
+  of equipment, and SAGE searches related SOPs _and_ engineering
   correspondence for that equipment before taking your word for it — a real
   conflict gets a distinct flag, both in the Console and in any document it
   drafts, not just buried in prose.
@@ -96,11 +98,11 @@ run code, and do exact math — instead of guessing.
   you type in English and get the answer translated into any of those
   languages anyway (or the reverse — ask in Hindi, pin the answer to
   English). Clicking one re-translates every answer already on screen right
-  away, not just the next thing you send. *(The
+  away, not just the next thing you send. _(The
   translation model, IndicTrans2, needs a one-time authenticated download
   before this works — see
   [Setup](#5-optional-enable-regional-language-translation). Everything else
-  on this page works without it.)*
+  on this page works without it.)_
 
 ## What's coming next
 
@@ -141,7 +143,7 @@ visible "zero external calls" network monitor.
     (`reasoning` / `coding` / `vision` / `embedding`), and a single config file
     (`backend/config/models.yaml`) decides which actual model handles each one.
     Changing that file — or clicking a button in the Model Registry page — is the
-    *only* thing needed to swap models. No code ever hardcodes a model name.
+    _only_ thing needed to swap models. No code ever hardcodes a model name.
   - An **agent** (`app/agent.py`) that the Console talks to: it hands your prompt
     to the reasoning model along with a toolbox (search the knowledge base, read
     an attached image, transcribe attached audio, run sandboxed code, calculate,
@@ -150,7 +152,7 @@ visible "zero external calls" network monitor.
   - A **language layer** (`app/language/`) that wraps the agent from the
     outside, transparently: detect the prompt's language (fastText), and if
     it's a supported non-English language, translate to English (IndicTrans2),
-    run the *same, unmodified* agent, then translate the answer back. English
+    run the _same, unmodified_ agent, then translate the answer back. English
     requests never touch this layer at all.
 - **Ollama** serves the actual language models, both models running fully on your
   machine and (optionally, for speed during development) models proxied through
@@ -163,8 +165,8 @@ visible "zero external calls" network monitor.
 
 ### A request, step by step
 
-Say you type into the Console: *"How often shall critical service valves be
-visually inspected?"*
+Say you type into the Console: _"How often shall critical service valves be
+visually inspected?"_
 
 1. The agent reads your prompt and decides it needs the `search_knowledge_base`
    tool — it doesn't answer from memory.
@@ -174,8 +176,8 @@ visually inspected?"*
    page and section it came from — you see this happen live, step by step, not
    after a long spinner.
 
-A more involved request — *"I attached a scanned inspection report; check the
-finding against our SOPs and draft an approval note"* — plays out the same way,
+A more involved request — _"I attached a scanned inspection report; check the
+finding against our SOPs and draft an approval note"_ — plays out the same way,
 just with more steps: read the image → search the procedures (more than once, if
 the first search doesn't cover escalation/urgency requirements) → write the
 `.docx`. Nothing is hardcoded about which steps a request needs; the agent works
@@ -333,16 +335,16 @@ questions.
 
 ### Simple — one capability at a time
 
-| What you type | What happens |
-| --- | --- |
-| *"How often shall critical service valves be visually inspected?"* | Searches the knowledge base, answers **"every 6 months"** with a citation back to the exact page/section. |
-| *"What is 5000 newtons over 0.02 square meters, in pascals?"* | Computes it with a real math engine (not a guess): **250,000 Pa**. |
-| *"Write and run code to check whether 97 is a prime number."* | Writes a real Python script, runs it in the network-isolated sandbox, and reports the actual output: **True**. |
-| *(attach a scanned/photographed form)* + *"Read this and summarize the finding."* | Reads the image with the vision model and describes what's on it. |
-| *"I have wall-thickness readings from 12 vessel inspections over time: months=[0,3,6,...], thickness_mm=[12.0,11.8,...]. Fit a model and tell me the corrosion rate and how reliable the trend is."* | Actually fits a linear regression (scikit-learn, held-out test split) instead of guessing a trend — reports the real slope (**≈ ‑0.057 mm/month**) and test-set R² (**0.9996**). |
-| *(hit 🎤 and ask your question out loud, or attach a voice memo)* | Local speech-to-text (faster-whisper) transcribes it — auto-detecting the language — and the agent answers what you actually asked, same as if you'd typed it. |
-| *"Export this data as an Excel spreadsheet: months=[0,3,6,9], thickness_mm=[12.0,11.9,11.8,11.7]."* | Produces a real, downloadable `.xlsx` — actual numeric cells, sortable/usable in formulas, not text pasted into a grid. |
-| *(attach a handwritten field note)* + *"Did this technician follow procedure?"* | Reads the handwriting, searches the relevant SOP, and checks the actual documented steps against it — not just a scanned form this time, a free-form note. |
+| What you type                                                                                                                                                                                        | What happens                                                                                                                                                                     |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| _"How often shall critical service valves be visually inspected?"_                                                                                                                                   | Searches the knowledge base, answers **"every 6 months"** with a citation back to the exact page/section.                                                                        |
+| _"What is 5000 newtons over 0.02 square meters, in pascals?"_                                                                                                                                        | Computes it with a real math engine (not a guess): **250,000 Pa**.                                                                                                               |
+| _"Write and run code to check whether 97 is a prime number."_                                                                                                                                        | Writes a real Python script, runs it in the network-isolated sandbox, and reports the actual output: **True**.                                                                   |
+| _(attach a scanned/photographed form)_ + _"Read this and summarize the finding."_                                                                                                                    | Reads the image with the vision model and describes what's on it.                                                                                                                |
+| _"I have wall-thickness readings from 12 vessel inspections over time: months=[0,3,6,...], thickness_mm=[12.0,11.8,...]. Fit a model and tell me the corrosion rate and how reliable the trend is."_ | Actually fits a linear regression (scikit-learn, held-out test split) instead of guessing a trend — reports the real slope (**≈ ‑0.057 mm/month**) and test-set R² (**0.9996**). |
+| _(hit 🎤 and ask your question out loud, or attach a voice memo)_                                                                                                                                    | Local speech-to-text (faster-whisper) transcribes it — auto-detecting the language — and the agent answers what you actually asked, same as if you'd typed it.                   |
+| _"Export this data as an Excel spreadsheet: months=[0,3,6,9], thickness_mm=[12.0,11.9,11.8,11.7]."_                                                                                                  | Produces a real, downloadable `.xlsx` — actual numeric cells, sortable/usable in formulas, not text pasted into a grid.                                                          |
+| _(attach a handwritten field note)_ + _"Did this technician follow procedure?"_                                                                                                                      | Reads the handwriting, searches the relevant SOP, and checks the actual documented steps against it — not just a scanned form this time, a free-form note.                       |
 
 ### Multi-step / complex — the agent chains several tools on its own
 
@@ -351,20 +353,20 @@ the agent decides on its own how many steps and which tools it needs.
 
 **1. Search, then calculate**
 
-> *"What is the minimum oxygen percentage required before confined space entry?
+> _"What is the minimum oxygen percentage required before confined space entry?
 > If a space currently reads 18.2 percent, how many percentage points short is
-> that, precisely?"*
+> that, precisely?"_
 
-It searches the knowledge base for the requirement (19.5%), *then* hands the
+It searches the knowledge base for the requirement (19.5%), _then_ hands the
 numbers to the calculation tool rather than doing the subtraction itself —
 **1.3 percentage points short**, with the SOP citation for where 19.5% came from.
 
 **2. Search, calculate, and file a real document — three tools, one prompt**
 
-> *"Search for the recertification interval for pressure relief valves in
+> _"Search for the recertification interval for pressure relief valves in
 > dirty/fouling service, calculate exactly how many recertifications occur over
 > a 10-year service life, and save the answer as a short docx note titled 'PRV
-> Recertification Schedule'."*
+> Recertification Schedule'."_
 
 Search finds the rule (recertify every 12 months in fouling service) → calculate
 works out 10 years ÷ 1 year = **10 recertifications** → a real `.docx` gets
@@ -373,14 +375,14 @@ written and shows up in Deliverables — all from one message.
 **3. The flagship example — read an image, cross-check it against procedure, and
 catch a mistake a human made**
 
-> *(attach a scanned, filled-in inspection form)* +
-> *"I attached a scanned inspection report. Read it, check the finding against
-> our SOPs, and draft a formal approval note as a docx."*
+> _(attach a scanned, filled-in inspection form)_ +
+> _"I attached a scanned inspection report. Read it, check the finding against
+> our SOPs, and draft a formal approval note as a docx."_
 
 This is the one that shows why grounding matters. The sample form describes a
 **severe** valve leak, and the technician's own handwritten note recommends just
 logging it through the standard 48-hour report. The agent reads the image,
-searches the procedures — including a *second, more specific* search for
+searches the procedures — including a _second, more specific_ search for
 escalation requirements, since the first search alone doesn't surface the
 right clause — and finds that a severe leak actually requires an **immediate
 shutdown request**, not the technician's own recommendation. The final `.docx`
@@ -389,8 +391,8 @@ it, instead of quietly rubber-stamping the wrong call.
 
 **4. Ask it out loud — voice in, grounded answer out**
 
-> *(record) "What is the minimum oxygen percentage required before confined
-> space entry?"*
+> _(record) "What is the minimum oxygen percentage required before confined
+> space entry?"_
 
 Hit record, and the transcript appears in the text box as soon as you stop —
 review or edit it, then send it like anything else you'd type. From there
@@ -401,14 +403,14 @@ your voice instead of the keyboard.
 **5. A genuinely hard analysis question — regression, confidence interval, and
 engineering judgment in one go**
 
-> *"I have wall-thickness readings from 12 vessel inspections over time:
+> _"I have wall-thickness readings from 12 vessel inspections over time:
 > months = [0, 3, 6, ..., 33] and thickness_mm = [12.00, 11.94, ..., 11.35].
 > Fit an appropriate regression model, report the corrosion rate in mm/month
 > and mm/year, the fitted equation, R², and a confidence interval for the
 > rate. Assess how reliable the trend is, whether a linear model is
 > appropriate, the total thickness loss, how to use the rate to predict
 > remaining service life, and the limitations (measurement uncertainty, UT
-> repeatability, localized/pitting corrosion)."*
+> repeatability, localized/pitting corrosion)."_
 
 This is the one worth watching the "Thinking…" block for — it's a lot to ask
 in one message. The agent fits a real regression (`fit_linear_regression`:
@@ -419,7 +421,7 @@ and completely in well under 15 seconds.
 
 Then, as a **follow-up in the same chat**, just:
 
-> *"convert it into a word doc"*
+> _"convert it into a word doc"_
 
 No need to repeat the data or the results — the agent remembers its own
 answer from the message above and drafts a real `.docx` straight from it,
@@ -431,9 +433,9 @@ confidence interval) render as actual typeset math, not raw `\[...\]` text.
 
 **6. Catch a drawing that doesn't match the spec — P&ID cross-referencing**
 
-> *(attach a P&ID drawing excerpt and its equipment spec sheet)* +
-> *"Check whether each tagged symbol on the drawing matches what the spec
-> requires and flag any mismatches."*
+> _(attach a P&ID drawing excerpt and its equipment spec sheet)_ +
+> _"Check whether each tagged symbol on the drawing matches what the spec
+> requires and flag any mismatches."_
 
 The agent reads the drawing with `read_pid_drawing` — a vision call
 constrained to a small, explicit symbol legend (gate valve, control valve,
@@ -448,12 +450,12 @@ inspection-report example above, applied to a drawing instead of text.
 
 **7. Catch a new finding that contradicts what's already on record**
 
-> *"The latest UT thickness reading for Vessel V-2201 came back at 9.8 mm.
+> _"The latest UT thickness reading for Vessel V-2201 came back at 9.8 mm.
 > Check this against our records and let me know if there's anything I
-> need to be concerned about."*
+> need to be concerned about."_
 
 The agent doesn't just answer from the number you gave it — it searches for
-related SOPs *and engineering correspondence* on that specific vessel,
+related SOPs _and engineering correspondence_ on that specific vessel,
 finds that a fitness-for-service memo set V-2201's minimum allowable wall
 thickness at 10.5 mm, and flags the conflict explicitly (a distinct red
 banner in the Console, not just another line of text) with the exact
@@ -479,7 +481,7 @@ number near a limit."
 - **A non-English question fails with "gated repo" / 401 or 403** — you
   skipped [step 5](#5-optional-enable-regional-language-translation)
   (IndicTrans2 needs a one-time HuggingFace login, accepting the terms on
-  *both* model pages, and `HF_TOKEN`); English works regardless, and
+  _both_ model pages, and `HF_TOKEN`); English works regardless, and
   speech-to-text's own language detection isn't affected by this.
 - **Translation still doesn't work even with a valid, authorized `HF_TOKEN`**
   — known, currently unresolved: past the auth wall, IndicTrans2's official
